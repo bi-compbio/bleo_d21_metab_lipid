@@ -1,0 +1,279 @@
+---
+title: "Metabolic network analysis"
+author: "Sergio Picart-Armada"
+date: "8th March, 2020"
+output:
+  html_document:
+    toc: TRUE
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, 
+                      error = FALSE, warning = FALSE, 
+                      fig.height = 4)
+```
+
+# Loading the data
+
+```{r cars}
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(magrittr)
+
+library(ggplot2)
+library(ggpmisc)
+library(plotly)
+library(psych)
+
+library(data.table)
+
+library(clusterProfiler)
+
+# metabolomics
+library(FELLA)
+library(igraph)
+
+config <- new.env()
+source("config.R", local = config)
+source("helpers.R")
+
+theme_set(theme_bw())
+
+dir.out <- config$dir.fella
+if (!dir.exists(dir.out)) dir.create(dir.out)
+
+set.seed(1)
+```
+
+FELLA database
+
+```{r}
+# save db in project root
+fella.db <- config$fella.db
+
+if (!dir.exists(fella.db)) {
+  g <- FELLA::buildGraphFromKEGGREST(organism = "mmu", filter.path = "01100")
+  FELLA::buildDataFromGraph(
+    g, databaseDir = fella.db,
+    internalDir = FALSE,
+    matrices = c("hypergeom", "diffusion"),
+    normality = c("hypergeom", "diffusion"),
+    niter = 1000)
+}
+fella.data <- FELLA::loadKEGGdata(fella.db, internalDir = FALSE, loadMatrix = "hypergeom")
+```
+
+```{r}
+fc.ref <- config$fc.ref
+q.ref <- config$q.ref
+```
+
+Load fold changes
+
+```{r}
+df.fc.trt <- read.csv(config$df.fc.trt)
+```
+
+# FELLA network analysis
+
+## Network summary
+
+Mouse network from KEGG
+
+```{r}
+fella.data
+```
+## Lists of metabolites
+
+```{r}
+cpd.young <- filter(df.fc.trt, Age == "Young" & se == "Metabolites" & signif)$db.id %>% unique %>% na.omit
+cpd.old <- filter(df.fc.trt, Age == "Old" & se == "Metabolites" & signif)$db.id %>% unique %>% na.omit
+cpd.both <- intersect(cpd.old, cpd.young)
+
+
+cpd.bkgd <- filter(df.fc.trt, Age == "Old" & se == "Metabolites")$db.id %>% unique %>% na.omit
+```
+
+
+## Young
+
+```{r}
+enr.young <- FELLA::enrich(cpd.young, methods = "diffusion", data = fella.data)
+g.young <- FELLA::generateResultsGraph(object = enr.young, data = fella.data)
+
+g.young %>%
+  igraph_to_visnetwork()
+```
+
+Number of nodes
+
+```{r}
+vcount(g.young)
+```
+
+Entities in it
+
+```{r}
+tab.young <- generateResultsTable(object = enr.young, data = fella.data) 
+
+write.csv(tab.young, paste0(dir.out, "/subnetwork_all_young.csv"))
+
+DT::datatable(tab.young)
+```
+
+Enzymes with gene annotations
+
+```{r}
+enz.young <- generateEnzymesTable(object = enr.young, data = fella.data) 
+
+write.csv(enz.young, paste0(dir.out, "/subnetwork_enzymes_young.csv"))
+
+DT::datatable(enz.young)
+```
+
+
+## Old
+
+
+```{r}
+
+enr.old <- FELLA::enrich(cpd.old, methods = "diffusion", data = fella.data)
+g.old <- FELLA::generateResultsGraph(object = enr.old, data = fella.data)
+
+g.old %>%
+  igraph_to_visnetwork()
+```
+
+
+Number of nodes
+
+```{r}
+vcount(g.old)
+```
+
+Entities in it
+
+```{r}
+tab.old <- generateResultsTable(object = enr.old, data = fella.data) 
+
+write.csv(tab.old, paste0(dir.out, "/subnetwork_all_old.csv"))
+
+DT::datatable(tab.old)
+```
+
+Enzymes with gene annotations
+
+```{r}
+enz.old <- generateEnzymesTable(object = enr.old, data = fella.data) 
+
+write.csv(enz.old, paste0(dir.out, "/subnetwork_enzymes_old.csv"))
+
+DT::datatable(enz.old)
+```
+
+## Intersection old and young
+
+```{r, fig.width=7, fig.height=7}
+enr.both <- FELLA::enrich(cpd.both, methods = "diffusion", data = fella.data)
+g.both <- FELLA::generateResultsGraph(object = enr.both, data = fella.data, LabelLengthAtPlot = 100)
+
+g.both %>% igraph_to_visnetwork() 
+  
+```
+
+For exporting: really large plot (first right click and save PNG, then browse it)
+
+```{r}
+g.both %>% igraph_to_visnetwork(width = "3200px", height = "3200px")
+```
+
+
+Number of nodes
+
+```{r}
+vcount(g.both)
+```
+
+Entities in it
+
+```{r}
+tab.both <- generateResultsTable(object = enr.both, data = fella.data, LabelLengthAtPlot = 100) 
+
+write.csv(tab.both, paste0(dir.out, "/subnetwork_all_intersectoldyoung.csv"))
+
+DT::datatable(tab.both)
+```
+
+Enzymes with gene annotations
+
+```{r}
+enz.both <- generateEnzymesTable(object = enr.both, data = fella.data) 
+
+write.csv(enz.both, paste0(dir.out, "/subnetwork_enzymes_intersectoldyoung.csv"))
+
+DT::datatable(enz.both)
+```
+
+
+### Export plot with customised igraph plotting
+
+Can we export to SVG?
+
+```{r, fig.width=8, fig.height=8}
+# reproducible layout?
+set.seed(2)
+g.both.plt <- igraph_add_graphical_params(g.both) 
+
+V(g.both.plt)[com %in% c(4)]$label <- ""
+V(g.both.plt)$label.dist <- .7
+V(g.both.plt)$label.cex <- .7
+# V(g.both.plt)$shape <- "rectangle"
+V(g.both.plt)$label.color %<>% paste0("FF")
+V(g.both.plt)$color %<>% paste0("55")
+
+pdf(paste0(dir.out, "/subnetwork_intersect.pdf"), width = 10, height = 10)
+plot(g.both.plt)
+dev.off()
+```
+
+### ggnet2
+
+```{r}
+# library(network)
+# library(ggnet2)
+# not in easybuild/cran
+```
+
+### NetworkD3
+
+Not easy to export...
+
+```{r}
+d3.both.plt <- networkD3::igraph_to_networkD3(g.both.plt, group = V(g.both.plt)$com) 
+
+# Create force directed network plot
+networkD3::forceNetwork(
+  Links = d3.both.plt$links, Nodes = d3.both.plt$nodes,
+  Source = 'source', Target = 'target', NodeID = 'name',
+  Group = 'group')
+
+```
+
+
+
+# Reproducibility
+
+```{r}
+date()
+```
+
+```{r}
+sessionInfo()
+```
+
+
+

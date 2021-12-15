@@ -1,0 +1,1566 @@
+---
+title: "Pathway analysis"
+author: "Sergio Picart-Armada"
+date: "8th March, 2020"
+output:
+  html_document:
+    toc: TRUE
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, 
+                      error = FALSE, warning = FALSE, 
+                      fig.height = 4)
+```
+
+# Loading the data
+
+```{r cars}
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(magrittr)
+
+library(SummarizedExperiment)
+library(MultiAssayExperiment)
+
+library(ggplot2)
+library(ggpmisc)
+library(plotly)
+# library(GGally)
+# library(corrplot)
+library(psych)
+
+# library(pls)
+# library(pcaMethods)
+# library(emmeans)
+
+library(data.table)
+# library(UpSetR)
+
+library(clusterProfiler)
+
+library(pheatmap)
+
+config <- new.env()
+source("config.R", local = config)
+source("helpers.R")
+
+# load all the omics data
+mae <- readRDS(config$out.mae)
+
+theme_set(theme_bw())
+
+futile.logger::flog.threshold(futile.logger::ERROR, name = "VennDiagramLogger")
+
+dir.out <- config$dir.pathways
+if (!dir.exists(dir.out)) dir.create(dir.out)
+
+set.seed(1)
+```
+
+```{r}
+fc.ref <- config$fc.ref
+q.ref <- config$q.ref
+```
+
+```{r}
+v.oldyoung.labels <- config$v.oldyoung.labels
+v.oldyoung.colors <- config$v.oldyoung.colors
+```
+
+
+## Sanity checks
+
+```{r}
+plyr::l_ply(experiments(mae), 
+       function(se) stopifnot(levels(colData(se)$TRT)[2] == "Bleo")
+)
+plyr::l_ply(experiments(mae), 
+       function(se) stopifnot(levels(colData(se)$AGE)[2] == "21M")
+)
+
+lapply(experiments(mae), 
+       function(se) levels(colData(se)$TRT))
+lapply(experiments(mae), 
+       function(se) levels(colData(se)$AGE))
+
+# check sample mapping concistency
+# if this breaks down, check sampleMap(mae)
+mae[, colData(mae)$AnimalID]
+```
+
+Use chemical names for better readability
+
+
+```{r}
+
+rownames(experiments(mae)$Lipids) <- rowData(experiments(mae)$Lipids)$BIOCHEMICAL
+rownames(experiments(mae)$Metabolites) <- rowData(experiments(mae)$Metabolites)$BIOCHEMICAL
+
+```
+
+
+Load fold changes
+
+```{r}
+df.fc.trt <- read.csv(config$df.fc.trt)
+```
+
+# KEGG pathways
+
+## KEGG data
+
+```{r}
+path.name <- read.table(config$file.kegg.mmu.list, sep = "\t") %>%
+  mutate(V1 = gsub("path:", "", V1), 
+         V2 = gsub(" - Mus .+", "", V2))
+
+# kegg pathways (cpd)
+path.cpd <- read.table(config$file.kegg.mmu.cpd) %>%
+  mutate(V2 = gsub("cpd:", "", V2), 
+         V1 = gsub("path:map", "mmu", V1)) %>%
+  dplyr::filter(V1 %in% path.name$V1)
+
+# kegg pathways (gene)
+path.entrez <- read.table(config$file.kegg.mmu.gene) %>%
+  mutate(V2 = gsub("mmu:", "", V2), 
+         V1 = gsub("path:", "", V1))
+
+# exclude big pathways
+list.pathways <- setdiff(path.name$V1, c("mmu01100", "mmu01210", "mmu01212"))
+
+
+df.brite <- keggbrite2df(config$file.kegg.brite) %>%
+  mutate(pathway = gsub("map", "mmu", kegg.id)) %>%
+  dplyr::select(-kegg.id) %>%
+  dplyr::rename(pathway.kegg.id = pathway)
+
+# put everything together
+path.brite <- dplyr::rename(path.name, pathway.name.short = V2) %>%
+  dplyr::inner_join(path.cpd) %>% 
+  dplyr::rename(pathway.kegg.id = V1, db.id = V2) %>%
+  inner_join(df.brite)
+```
+
+# KEGG ORA 
+
+## Enrichment tables {.tabset}
+
+```{r}
+# All hits
+list.list.keggall <- plyr::dlply(df.fc.trt, "Age", plyr::dlply, "se", function(df) {
+  df.sig <- dplyr::filter(df, spval.adj.TRT < q.ref & abs(scoef.TRT) > fc.ref)
+  # df.sig <- filter(df, adj.P.Val < q.ref & abs(logFC) > fc.ref)
+  
+  markers.bkgd <- df$db.id %>% na.omit %>% as.character %>% unique 
+  markers.sig <- df.sig$db.id %>% na.omit %>% as.character %>% unique
+  
+  db <- df$db[1]
+  
+  if (db == "entrez.id") {
+    path.df <- path.entrez
+  } else if (db == "KEGG") {
+    path.df <- path.cpd
+  } else {
+    return()
+  }
+  df.ans <- enricher(gene = markers.sig, 
+                     pvalueCutoff = Inf,
+                     qvalueCutoff = Inf,
+                     minGSSize = 5,
+                     pAdjustMethod = "fdr",
+                     universe = markers.bkgd, 
+                     TERM2GENE = path.df, 
+                     TERM2NAME = path.name) %>% 
+    as.data.frame %>%
+    set_rownames(NULL)
+  
+  if (nrow(df.ans) > 0) {
+    df.ans %>%
+      dplyr::mutate(pathway.kegg.id = ID) %>%
+      plyr::join(df.brite, type = "left")
+  } else {
+    df.ans
+  }
+})
+
+# Only singificant (only change is threshold)
+# Did this dirty copypaste since subsetting later would drop the attributes Age and se
+# and plots would fail
+list.list.kegg <- plyr::dlply(df.fc.trt, "Age", plyr::dlply, "se", function(df) {
+  df.sig <- dplyr::filter(df, spval.adj.TRT < q.ref & abs(scoef.TRT) > fc.ref)
+  # df.sig <- filter(df, adj.P.Val < q.ref & abs(logFC) > fc.ref)
+  
+  markers.bkgd <- df$db.id %>% na.omit %>% as.character %>% unique 
+  markers.sig <- df.sig$db.id %>% na.omit %>% as.character %>% unique
+  
+  db <- df$db[1]
+  
+  if (db == "entrez.id") {
+    path.df <- path.entrez
+  } else if (db == "KEGG") {
+    path.df <- path.cpd
+  } else {
+    return()
+  }
+  df.ans <- enricher(gene = markers.sig, 
+                     pvalueCutoff = Inf,
+                     qvalueCutoff = q.ref,
+                     minGSSize = 5,
+                     pAdjustMethod = "fdr",
+                     universe = markers.bkgd, 
+                     TERM2GENE = path.df, 
+                     TERM2NAME = path.name) %>% 
+    as.data.frame %>%
+    set_rownames(NULL)
+  
+  if (nrow(df.ans) > 0) {
+    df.ans %>%
+      dplyr::mutate(pathway.kegg.id = ID) %>%
+      plyr::join(df.brite, type = "left")
+  } else {
+    df.ans
+  }
+})
+
+# export tables
+write.csv(list.list.keggall$Old$Metabolites, paste0(config$dir.pathways, "/ora_old_metab_kegg.csv"), row.names = FALSE)
+write.csv(list.list.keggall$Young$Metabolites, paste0(config$dir.pathways, "/ora_young_metab_kegg.csv"), row.names = FALSE)
+write.csv(list.list.keggall$Old$Lipids, paste0(config$dir.pathways, "/ora_old_lipid_kegg.csv"), row.names = FALSE)
+write.csv(list.list.keggall$Young$Lipids, paste0(config$dir.pathways, "/ora_young_lipid_kegg.csv"), row.names = FALSE)
+```
+
+Number of pathways (complete table)
+
+```{r}
+plyr::ldply(list.list.keggall, plyr::ldply, nrow) %>%
+  tidyr::spread(Age, V1)
+```
+
+Number of significant KEGG pathways at $FDR < `r q.ref`$ using the `lm`s:
+
+```{r}
+plyr::ldply(list.list.kegg, plyr::ldply, nrow) %>%
+  tidyr::spread(Age, V1)
+```
+
+
+`r list_list_dfs_to_knitr(list.list.kegg)`
+
+## KEGG brite
+
+The KEGG brite was used to give further context to the KEGG pathways 
+found through ORA (see tables above).
+The following plots display the amount (number) and proportion (fill colour) 
+of significant pathways within each brite category, 
+stratified by age group and omic
+
+### L1 brite
+
+All the significant pathways:
+
+```{r, fig.width=10, fig.height=7}
+df.ora <- plyr::ldply(list.list.kegg, plyr::ldply, identity) 
+
+ggplot(df.ora, aes(x = se, y = Description)) +
+  geom_tile(aes(fill = -log10(qvalue)), width = .8, height = .8) + 
+  scale_fill_gradient2(low = "gray80", high = "indianred1", 
+                       name = "-log10(qvalue)") +
+  facet_grid(L2~Age, scales = "free_y", space = "free") + 
+  xlab("Omic") + 
+  ylab("KEGG pathway") + 
+  theme(aspect.ratio = 1, 
+        strip.text.y = element_text(angle = 0), 
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  gg_45()
+
+ggsave(paste0(dir.out, "/tileplot_kegg_brite_allsignif.pdf"))
+ggsave(paste0(dir.out, "/tileplot_kegg_brite_allsignif.png"))
+ggsave(paste0(dir.out, "/tileplot_kegg_brite_allsignif.svg"))
+```
+```{r}
+df.plotbrite <- plyr::ldply(
+  list.list.kegg, function(lst) {
+    plyr::ldply(lst, function(omic) {
+      dplyr::mutate(
+        df.brite, 
+        signif = pathway.kegg.id %in% as.character(omic$ID))
+    })
+  }
+)
+```
+
+### L1 brite (alternative format)
+
+```{r}
+dplyr::group_by(df.plotbrite, L1, Age, se) %>%
+  dplyr::summarise(prop.signif = mean(signif), 
+                   n.signif = sum(signif)) %>%
+  ggplot(aes(x = L1, y = se)) +
+  geom_tile(aes(fill = prop.signif)) + 
+  geom_text(aes(label = n.signif)) +
+  scale_fill_gradient2(low = "gray80", high = "indianred1", 
+                       name = "Proportion of\npositive pathways") +
+  facet_wrap(~Age) + 
+  xlab("KEGG L1 brite") + 
+  ylab("") + 
+  theme(aspect.ratio = 1) +
+  gg_45()
+
+ggsave(paste0(dir.out, "/tileplot_kegg_brite_L1.svg"))
+ggsave(paste0(dir.out, "/tileplot_kegg_brite_L1.pdf"))
+ggsave(paste0(dir.out, "/tileplot_kegg_brite_L1.png"))
+```
+
+### L2 brite
+
+```{r, fig.width=10, fig.height=10}
+dplyr::group_by(df.plotbrite, L1, L2, Age, se) %>%
+  dplyr::summarise(prop.signif = mean(signif), 
+                   n.signif = sum(signif)) %>%
+  ggplot(aes(x = se, y = L2)) +
+  geom_tile(aes(fill = prop.signif)) + 
+  geom_text(aes(label = n.signif)) +
+  scale_fill_gradient2(low = "gray80", high = "indianred1", 
+                       name = "Proportion of\npositive pathways") +
+  facet_grid(L1~Age, scales = "free", space = "free") + 
+  xlab("") + 
+  ylab("KEGG L1 and L2 brite") + 
+  theme(aspect.ratio = 1, 
+        strip.text.y = element_text(angle = 0)) +
+  gg_45()
+
+ggsave(paste0(dir.out, "/tileplot_kegg_brite_L2.svg"))
+ggsave(paste0(dir.out, "/tileplot_kegg_brite_L2.pdf"))
+ggsave(paste0(dir.out, "/tileplot_kegg_brite_L2.png"))
+```
+
+
+### Venn diagrams by omic
+
+```{r, fig.width=4, fig.height=4}
+plyr::d_ply(df.ora, "Age", function(df.age) {
+  list.byomic <- split(df.age$Description, 
+                       as.character(df.age$se))
+  # fix order so that they agree with the scatterplot colour legend
+  list.byomic <- list.byomic[intersect(names(list.byomic), names(mae))]
+  age <- df.age$Age[1] %>% as.character
+  
+  grid::grid.newpage()
+  margin_venn(.9)
+  vn <- VennDiagram::venn.diagram(
+    list.byomic,
+    main = paste0("Pathway findings (", age, " mice)"),
+    print.mode = "raw", 
+    height = 1000,
+    width = 1000,
+    filename = NULL,
+    fill = config$col.omicLM[names(list.byomic)])
+  grid::grid.draw(vn)
+  
+  grDevices::svg(paste0(dir.out, "/venn_pathways_", age, ".svg"), width = 3, height = 3)
+  margin_venn(.9)
+  grid::grid.draw(vn)
+  grDevices::dev.off()
+
+})
+```
+
+### Venn diagrams by age
+
+```{r, fig.width=8.5, fig.height=8.5}
+plyr::l_ply(names(mae), function(se) {
+  dims <- 8.5
+  # browser()
+  old <- list.list.kegg$Old[[se]]$Description %>% 
+    stringr::str_trunc(width = 32)
+  young <- list.list.kegg$Young[[se]]$Description %>% 
+    stringr::str_trunc(width = 32)
+  
+  if (is.null(old)) old <- character()
+  if (is.null(young)) young <- character()
+  
+  # no empty diagrams
+  if (length(old) + length(young) == 0) return()
+  
+  print(se)
+  
+  ram_group_venn(list(Old = old, Young = young), 
+                 quote.callback.grid = quote(margin_venn(.8)), 
+                 fill = config$col.age,
+                  width = dims, height = dims)
+  
+  ram_group_venn(list(Old = old, Young = young), 
+                 quote.callback.grid = quote(margin_venn(.8)), 
+                 fill = config$col.age,
+                  width = dims, height = dims, 
+                  file = paste0(dir.out, "/vennnames_pathways_", se), 
+                  ext = "svg")
+  ram_group_venn(list(Old = old, Young = young), 
+                 quote.callback.grid = quote(margin_venn(.8)), 
+                 fill = config$col.age,
+                  width = 8/2.54, height = 8/2.54, 
+                  file = paste0(dir.out, "/vennnames_pathways_", se), 
+                  ext = "pdf", cex = .5, cat.cex = .5, lab.cex = .45)
+  ram_group_venn(list(Old = old, Young = young), 
+                 quote.callback.grid = quote(margin_venn(.8)), 
+                 fill = config$col.age,
+                  width = dims, height = dims, 
+                  file = paste0(dir.out, "/vennnames_pathways_", se), 
+                  ext = "png", 
+                 cat.pos = c(-30, 30))
+})
+```
+
+### Venn diagrams (numbers only)
+
+```{r, fig.width=3, fig.height=3}
+plyr::l_ply(names(mae), function(se) {
+  # browser()
+  old <- list.list.kegg$Old[[se]]$Description
+  young <- list.list.kegg$Young[[se]]$Description
+  
+  if (is.null(old)) old <- character()
+  if (is.null(young)) young <- character()
+  
+  if (length(old) + length(young) == 0) return()
+  
+  print(se)
+  
+  grid::grid.newpage()
+  margin_venn(.8)
+  vn <- VennDiagram::venn.diagram(
+    list(Old = old, Young = young),
+    main = paste0("Pathway hits (", se, ")"),
+    print.mode = "raw", 
+    category.names = c("", ""), 
+    main.cex = .65,
+    cex = .6,
+    lwd = .5,
+    ext.line.lwd = .5,
+    main.pos = c(0.5, 1.15) ,
+    # height = 1000,
+    # width = 1000,
+    filename = NULL,
+    fill = config$col.age)
+  grid::grid.draw(vn)
+  
+  grDevices::svg(paste0(dir.out, "/venn_pathways_", se, ".svg"), width = 1.5, height = 1.5)
+  grid::grid.newpage()
+  margin_venn(.7)
+  grid::grid.draw(vn)
+  grDevices::dev.off()
+  
+  grDevices::pdf(paste0(dir.out, "/venn_pathways_", se, ".pdf"), 
+               width = 2/2.54, height = 2/2.54, pointsize = 8.5)
+  grid::grid.draw(vn)
+  grDevices::dev.off()
+      
+  grDevices::png(paste0(dir.out, "/venn_pathways_", se, ".png"), width = 1.5, 
+                 height = 1.5, units = "in", res = 150)
+  grid::grid.newpage()
+  margin_venn(.7)
+  grid::grid.draw(vn)
+  grDevices::dev.off()
+})
+```
+
+# Metabolon (metabolites)
+
+## Metabolon ORA (metabolites) {.tabset}
+
+Given the greater metabolite coverage through the Metabolon pathways, 
+those were also tested independently.
+
+
+```{r}
+list.metabcol <- c("SUPER_PATHWAY", "SUB_PATHWAY")
+df.metabpath <- mae[["Metabolites"]] %>%
+  rowData %>% 
+  as.data.frame %>%
+  `[`(c("metabolite.id", "BIOCHEMICAL", "Group.HMDB", list.metabcol)) %>%
+  dplyr::rename(biomarker = metabolite.id, 
+                HMDB = Group.HMDB) %>%
+  dplyr::mutate(biomarker = BIOCHEMICAL)
+
+# only significant pathways
+list.list.metab <- dplyr::filter(df.fc.trt, se == "Metabolites") %>%
+  join(df.metabpath, by = "biomarker", type = "left") %>%
+  plyr::dlply("Age", function(df) {
+    # browser()
+    df.sig <- dplyr::filter(df, signif)
+    
+    # using all the entities
+    markers.bkgd <- df$BIOCHEMICAL %>% as.character %>% unique 
+    markers.sig <- df.sig$BIOCHEMICAL %>% as.character %>% unique
+    
+    list.raw <- plyr::llply(
+      list.metabcol, 
+      function(path.type) {
+        path.df <- df.metabpath[c(path.type, "BIOCHEMICAL")]
+        
+        enricher(gene = markers.sig, 
+                 pvalueCutoff = 1,
+                 qvalueCutoff = q.ref,
+                 minGSSize = 5,
+                 pAdjustMethod = "fdr",
+                 universe = markers.bkgd, 
+                 TERM2GENE = path.df) %>% 
+          as.data.frame %>%
+          set_rownames(NULL)
+      }) %>% set_names(list.metabcol)
+    
+    # using HMDB
+    # make sure to drop NAs
+    hmdb.bkgd <- df$HMDB %>% na.omit %>% as.character %>% unique
+    hmdb.sig <- df.sig$HMDB %>% na.omit %>% as.character %>% unique
+    
+    list.hmdb <- plyr::llply(
+      list.metabcol, 
+      function(path.type) {
+        # browser()
+        # remove repeated rows
+        path.df <- df.metabpath[c(path.type, "HMDB")] %>%
+          na.omit %>%
+          unique
+        
+        enricher(gene = hmdb.sig, 
+                 pvalueCutoff = 1,
+                 qvalueCutoff = q.ref,
+                 minGSSize = 5,
+                 pAdjustMethod = "fdr",
+                 universe = hmdb.bkgd, 
+                 TERM2GENE = path.df) %>% 
+          as.data.frame %>%
+          set_rownames(NULL)
+      }) %>% set_names(list.metabcol)
+    
+    c(all_biomarkers = list.raw, hmdb_markers = list.hmdb)
+})
+
+# all (no threshold on significance) - only change with above
+list.list.metaball <- dplyr::filter(df.fc.trt, se == "Metabolites") %>%
+  join(df.metabpath, by = "biomarker", type = "left") %>%
+  plyr::dlply("Age", function(df) {
+    # browser()
+    df.sig <- dplyr::filter(df, signif)
+    
+    # using all the entities
+    markers.bkgd <- df$BIOCHEMICAL %>% as.character %>% unique 
+    markers.sig <- df.sig$BIOCHEMICAL %>% as.character %>% unique
+    
+    list.raw <- plyr::llply(
+      list.metabcol, 
+      function(path.type) {
+        path.df <- df.metabpath[c(path.type, "BIOCHEMICAL")]
+        
+        enricher(gene = markers.sig, 
+                 pvalueCutoff = Inf,
+                 qvalueCutoff = Inf,
+                 minGSSize = 5,
+                 pAdjustMethod = "fdr",
+                 universe = markers.bkgd, 
+                 TERM2GENE = path.df) %>% 
+          as.data.frame %>%
+          set_rownames(NULL)
+      }) %>% set_names(list.metabcol)
+    
+    # using HMDB
+    # make sure to drop NAs
+    hmdb.bkgd <- df$HMDB %>% na.omit %>% as.character %>% unique
+    hmdb.sig <- df.sig$HMDB %>% na.omit %>% as.character %>% unique
+    
+    list.hmdb <- plyr::llply(
+      list.metabcol, 
+      function(path.type) {
+        # browser()
+        # remove repeated rows
+        path.df <- df.metabpath[c(path.type, "HMDB")] %>%
+          na.omit %>%
+          unique
+        
+        enricher(gene = hmdb.sig, 
+                 pvalueCutoff = Inf,
+                 qvalueCutoff = Inf,
+                 minGSSize = 5,
+                 pAdjustMethod = "fdr",
+                 universe = hmdb.bkgd, 
+                 TERM2GENE = path.df) %>% 
+          as.data.frame %>%
+          set_rownames(NULL)
+      }) %>% set_names(list.metabcol)
+    
+    c(all_biomarkers = list.raw, hmdb_markers = list.hmdb)
+})
+
+# export tables
+write.csv(list.list.metaball$Old$all_biomarkers.SUPER_PATHWAY, paste0(config$dir.pathways, "/ora_old_metab_metabolonsuperpath.csv"), row.names = FALSE)
+write.csv(list.list.metaball$Young$all_biomarkers.SUPER_PATHWAY, paste0(config$dir.pathways, "/ora_young_metab_metabolonsuperpath.csv"), row.names = FALSE)
+write.csv(list.list.metaball$Old$all_biomarkers.SUB_PATHWAY, paste0(config$dir.pathways, "/ora_old_metab_metabolonsubpath.csv"), row.names = FALSE)
+write.csv(list.list.metaball$Young$all_biomarkers.SUB_PATHWAY, paste0(config$dir.pathways, "/ora_young_metab_metabolonsubpath.csv"), row.names = FALSE)
+```
+
+
+
+
+`r list_list_dfs_to_knitr(list.list.metab)`
+
+
+# Metabolon (lipids)
+
+## Metabolon ORA (lung lipid) {.tabset}
+
+Given the low KEGG coverage for the lipids in our dataset, 
+an over representation analysis was conducted on the 
+super and sub-pathways provided by the Metabolon library.
+
+Separate analyses were run for:
+
+* All lipids
+* Only those with an HMDB identifier
+
+```{r}
+list.lipidcol <- c("SUPER_PATHWAY", "SUB_PATHWAY")
+df.lipidpath <- mae[["Lipids"]] %>%
+  rowData %>% 
+  as.data.frame %>%
+  `[`(c("rownames", "BIOCHEMICAL", "HMDB", list.lipidcol)) %>%
+  dplyr::mutate(biomarker = BIOCHEMICAL)
+
+list.list.lipid <- dplyr::filter(df.fc.trt, se == "Lipids") %>%
+  join(df.lipidpath, by = "biomarker", type = "left") %>%
+  plyr::dlply("Age", function(df) {
+    # browser()
+    df.sig <- dplyr::filter(df, signif)
+    
+    # using all the entities
+    markers.bkgd <- df$BIOCHEMICAL %>% as.character %>% unique 
+    markers.sig <- df.sig$BIOCHEMICAL %>% as.character %>% unique
+    
+    list.raw <- plyr::llply(
+      list.lipidcol, 
+      function(path.type) {
+        path.df <- df.lipidpath[c(path.type, "BIOCHEMICAL")]
+        
+        enricher(gene = markers.sig, 
+                 pvalueCutoff = 1,
+                 qvalueCutoff = q.ref,
+                 minGSSize = 5,
+                 pAdjustMethod = "fdr",
+                 universe = markers.bkgd, 
+                 TERM2GENE = path.df) %>% 
+          as.data.frame %>%
+          set_rownames(NULL)
+      }) %>% set_names(list.lipidcol)
+    
+    # using HMDB
+    # make sure to drop NAs
+    hmdb.bkgd <- df$HMDB %>% na.omit %>% as.character %>% unique
+    hmdb.sig <- df.sig$HMDB %>% na.omit %>% as.character %>% unique
+    
+    list.hmdb <- plyr::llply(
+      list.lipidcol, 
+      function(path.type) {
+        # browser()
+        # remove repeated rows
+        path.df <- df.lipidpath[c(path.type, "HMDB")] %>%
+          na.omit %>%
+          unique
+        
+        enricher(gene = hmdb.sig, 
+                 pvalueCutoff = 1,
+                 qvalueCutoff = q.ref,
+                 minGSSize = 5,
+                 pAdjustMethod = "fdr",
+                 universe = hmdb.bkgd, 
+                 TERM2GENE = path.df) %>% 
+          as.data.frame %>%
+          set_rownames(NULL)
+      }) %>% set_names(list.lipidcol)
+    
+    c(all_biomarkers = list.raw, hmdb_markers = list.hmdb)
+})
+
+# same with all pathways (not only signif)
+list.list.lipidall <- dplyr::filter(df.fc.trt, se == "Lipids") %>%
+  join(df.lipidpath, by = "biomarker", type = "left") %>%
+  plyr::dlply("Age", function(df) {
+    # browser()
+    df.sig <- dplyr::filter(df, signif)
+    
+    # using all the entities
+    markers.bkgd <- df$BIOCHEMICAL %>% as.character %>% unique 
+    markers.sig <- df.sig$BIOCHEMICAL %>% as.character %>% unique
+    
+    list.raw <- plyr::llply(
+      list.lipidcol, 
+      function(path.type) {
+        path.df <- df.lipidpath[c(path.type, "BIOCHEMICAL")]
+        
+        enricher(gene = markers.sig, 
+                 pvalueCutoff = Inf,
+                 qvalueCutoff = Inf,
+                 minGSSize = 5,
+                 pAdjustMethod = "fdr",
+                 universe = markers.bkgd, 
+                 TERM2GENE = path.df) %>% 
+          as.data.frame %>%
+          set_rownames(NULL)
+      }) %>% set_names(list.lipidcol)
+    
+    # using HMDB
+    # make sure to drop NAs
+    hmdb.bkgd <- df$HMDB %>% na.omit %>% as.character %>% unique
+    hmdb.sig <- df.sig$HMDB %>% na.omit %>% as.character %>% unique
+    
+    list.hmdb <- plyr::llply(
+      list.lipidcol, 
+      function(path.type) {
+        # browser()
+        # remove repeated rows
+        path.df <- df.lipidpath[c(path.type, "HMDB")] %>%
+          na.omit %>%
+          unique
+        
+        enricher(gene = hmdb.sig, 
+                 pvalueCutoff = Inf,
+                 qvalueCutoff = Inf,
+                 minGSSize = 5,
+                 pAdjustMethod = "fdr",
+                 universe = hmdb.bkgd, 
+                 TERM2GENE = path.df) %>% 
+          as.data.frame %>%
+          set_rownames(NULL)
+      }) %>% set_names(list.lipidcol)
+    
+    c(all_biomarkers = list.raw, hmdb_markers = list.hmdb)
+})
+
+
+# export tables
+write.csv(list.list.lipidall$Old$all_biomarkers.SUPER_PATHWAY, paste0(config$dir.pathways, "/ora_old_lipid_metabolonsuperpath.csv"), row.names = FALSE)
+write.csv(list.list.lipidall$Young$all_biomarkers.SUPER_PATHWAY, paste0(config$dir.pathways, "/ora_young_lipid_metabolonsuperpath.csv"), row.names = FALSE)
+write.csv(list.list.lipidall$Old$all_biomarkers.SUB_PATHWAY, paste0(config$dir.pathways, "/ora_old_lipid_metabolonsubpath.csv"), row.names = FALSE)
+write.csv(list.list.lipidall$Young$all_biomarkers.SUB_PATHWAY, paste0(config$dir.pathways, "/ora_young_lipid_metabolonsubpath.csv"), row.names = FALSE)
+```
+
+`r list_list_dfs_to_knitr(list.list.lipid)`
+
+## Venn diagrams (numbers only)
+
+```{r, fig.width=3, fig.height=3}
+plyr::l_ply(names(list.list.lipid$Old), function(lst) {
+  # browser()
+  old <- list.list.lipid$Old[[lst]]$Description
+  young <- list.list.lipid$Young[[lst]]$Description
+  
+  if (is.null(old)) old <- character()
+  if (is.null(young)) young <- character()
+  
+  if (length(old) + length(young) == 0) return()
+  
+  print(lst)
+  
+  grid::grid.newpage()
+  margin_venn(.8)
+  vn <- VennDiagram::venn.diagram(
+    list(Old = old, Young = young),
+    main = paste0("Metabolon lipid pathways"),
+    print.mode = "raw", 
+    category.names = c("", ""), 
+    main.cex = .65,
+    cex = .6,
+    lwd = .5,
+    ext.line.lwd = .5,
+    main.pos = c(0.5, 1.15) ,
+    # height = 1000,
+    # width = 1000,
+    filename = NULL,
+    fill = config$col.age)
+  grid::grid.draw(vn)
+  
+  grDevices::svg(paste0(dir.out, "/venn_pathways_lipid_", lst, ".svg"), width = 1.5, height = 1.5)
+  grid::grid.newpage()
+  margin_venn(.7)
+  grid::grid.draw(vn)
+  grDevices::dev.off()
+  
+  grDevices::pdf(paste0(dir.out, "/venn_pathways_lipid_", lst, ".pdf"), 
+               width = 2/2.54, height = 2/2.54, pointsize = 8.5)
+  grid::grid.draw(vn)
+  grDevices::dev.off()
+      
+  grDevices::png(paste0(dir.out, "/venn_pathways_lipid_", lst, ".png"), width = 1.5, 
+                 height = 1.5, units = "in", res = 150)
+  grid::grid.newpage()
+  margin_venn(.7)
+  grid::grid.draw(vn)
+  grDevices::dev.off()
+})
+```
+
+
+
+
+# KEGG pathview
+
+```{r}
+# create fake models weights, coincident with the FCs
+# put the non-significant ones to 0
+df.pathview <- mutate(df.fc.trt, 
+                      coef = ifelse(signif, scoef.TRT, 0)) %>%
+  dplyr::filter(!is.na(db.id)) %>%
+  arrange(desc(coef)) %>%
+  dplyr::distinct(Age, se, db.id, .keep_all = TRUE) %>%
+  arrange(se, desc(Age), biomarker) %>%
+  mutate(rowname = paste(se, db.id, sep = "_"))
+
+list.pathview <- df.pathview %>%
+  split(df.pathview$db) %>%
+  lapply(reshape2::acast, db.id~se+Age, value.var = "coef")
+
+plyr::ldply(list.pathview, colnames, .id = "Type of entity")
+```
+
+## KEGG pathview FC plots (lung)
+
+* Original `log2` fold changes are plotted
+* Those non-significant at  $FDR < `r q.ref`$ and $|\log_2(FC)| > `r fc.ref`$ 
+are grayed out (i.e. mapped to $0$)
+* Four stripes, legend
+
+```{r, results='hide'}
+# cl <- parallel::makePSOCKcluster(parallel::detectCores()/2)
+#     
+# parallel::clusterEvalQ(cl, library(pathview))
+# 
+# list.ans <- parallel::parLapplyLB(
+#   cl = cl, 
+#   X = setNames(list.pathways, list.pathways), 
+#   fun = function(...) try(pathview::pathview(...)),
+#   gene.data = list.pathview$entrez.id, 
+#   cpd.data = list.pathview$KEGG,
+#   limit = list(cpd = 2, gene = 2),
+#   cpd.idtype = "kegg", 
+#   gene.idtype = "entrez",
+#   out.suffix = "old-young",
+#   kegg.dir = config$dir.kegg, 
+#   species = "mmu",  
+#   match.data = FALSE,
+#   low = list(gene = "cornflowerblue", cpd = "cornflowerblue"), 
+#   mid = list(gene = "gray90", cpd = "gray90"),
+#   high = list(gene = "indianred1", cpd = "indianred1"))
+# 
+# files.mv <- list.files(pattern = ".+old-young.+png")
+# file.rename(files.mv, paste0(dir.pathview, "/", files.mv))
+# 
+# parallel::stopCluster(cl)
+```
+
+# KEGG pathway GSEA
+
+## Tables with enrichment {.tabset}
+
+The GSEA enrichment was applied to their fold changes with sign.
+Therefore, positive NES would correspond to an abundance of positive fold changes, 
+and negative NES would correspond to an enrichment in negative fold changes.
+
+```{r}
+list.list.kegggsea <- plyr::dlply(df.fc.trt, "Age", plyr::dlply, "se", function(df) {
+    
+  v <- setNames(df$scoef.TRT, as.character(df$db.id)) %>%
+    na.omit %>%
+    # abs %>% # works worse
+    sort(decreasing = TRUE)
+  
+  df.ans <- clusterProfiler::GSEA(
+    v, 
+    TERM2GENE = path.cpd, TERM2NAME = path.name, 
+    exponent = 1, nPerm = 100000, minGSSize = 10, 
+    maxGSSize = 500, pvalueCutoff = 1, 
+    pAdjustMethod = "fdr", seed = TRUE, by = "fgsea") %>%
+    as.data.frame 
+  # browser()
+  
+  # df.ans
+  
+  if (nrow(df.ans) > 0) {
+    df.ans %>%
+      dplyr::mutate(pathway.kegg.id = ID) %>%
+      plyr::join(df.brite, type = "left")
+  } else {
+    df.ans
+  }
+})
+
+# list.list.kegggsea$Young$Metabolites %>% View
+```
+
+Number of significant KEGG pathways at $FDR < 0.15$:
+
+```{r}
+plyr::llply(list.list.kegggsea, plyr::llply, subset, qvalues < .15) %>%
+  plyr::ldply(plyr::ldply, nrow, .id = "Age") %>%
+  tidyr::spread(Age, V1)
+```
+
+`r list_list_dfs_to_knitr(list.list.kegggsea)`
+
+Export the data frames for metabolomics
+
+```{r}
+write.csv(list.list.kegggsea$Old$Metabolites, paste0(config$dir.pathways, "/gsea_old_metab_kegg.csv"), row.names = FALSE)
+write.csv(list.list.kegggsea$Young$Metabolites, paste0(config$dir.pathways, "/gsea_young_metab_kegg.csv"), row.names = FALSE)
+```
+
+
+
+
+# Pathway agreement: KEGG
+
+### Based on FC agreement
+
+Two statistical tests were run to find differences in the distributions 
+of fold changes of all the pathway entities (merging the omics):
+
+* Wilcoxon signed rank paired test (differences are symmetric around $0$)
+* Kolmogorov-Smirnov test (distributions are equal)
+
+```{r}
+df.wilcox <- join(path.brite, df.pathview, by = "db.id", type = "inner") %>%
+  dplyr::select(pathway.name.short, pathway.kegg.id, se, db.id, Age, scoef.TRT) %>%
+  tidyr::spread(Age, scoef.TRT) 
+
+write.csv(df.wilcox, 
+          file = paste0(dir.out, "/diff_pathways.csv"), 
+          row.names = FALSE)
+```
+
+```{r}
+df.wilcoxplot <- plyr::ddply(
+  dplyr::filter(df.wilcox, se %in% c("Metabolites", "Lipids") & 
+                  !(pathway.kegg.id %in% c("mmu01100", "mmu01210", "mmu01212"))), 
+  c("pathway.name.short", "pathway.kegg.id"), 
+  function(df.p) {
+    # browser()
+    if (nrow(df.p) < 5) return()
+    
+    wt <- wilcox.test(x = df.p$Old, y = df.p$Young, 
+                      alternative = "two.sided", 
+                      paired = TRUE)
+    ks <- ks.test(x = df.p$Old, y = df.p$Young, 
+                  alternative = "two.sided")
+    
+    data.frame(pval.wilcox = wt$p.value, 
+               pval.ks = ks$p.value, 
+               n = nrow(df.p))
+  } 
+) %>% mutate(fdr.wilcox = p.adjust(pval.wilcox, method = "fdr"), 
+             fdr.ks = p.adjust(pval.ks, method = "fdr"), 
+             pathway.label = paste0(pathway.name.short, 
+                                    " (q = ", 
+                                    signif(fdr.wilcox, 3), 
+                                    ")")) %>%
+  join(df.brite)
+  
+```
+
+```{r, fig.height=5}
+tidyr::gather(df.wilcoxplot, "metric", "fdr", 
+              fdr.wilcox, fdr.ks) %>%
+  mutate(mlog10.fdr = -log10(fdr)) %>%
+  na.omit %>%
+  ggplot(aes(y = mlog10.fdr, fill = L1)) + 
+  geom_hline(yintercept = 6, colour = "gray50", lty = 1) +
+  geom_hline(yintercept = -log10(.05), colour = "gray60", lty = 3) +
+  geom_dotplot(aes(x = L1), binaxis = "y", stackdir = "center", 
+               dotsize = .5, stackratio = .7) + 
+  facet_wrap(~metric, scales = "free") + 
+  scale_fill_manual(values = config$col.briteL1) +
+  gg_45() +
+  ylab("-log10(FDR)") +
+  theme(legend.position = "none")
+```
+Significant differences through Wilcoxon test
+
+```{r}
+dplyr::filter(df.wilcoxplot, fdr.wilcox < 0.05) %>%
+  arrange(pval.wilcox)
+```
+
+Plot barplot with top 15 pathways
+
+```{r, fig.width=6, fig.height=4}
+arrange(df.wilcoxplot, pval.wilcox) %>%
+  head(15) %>%
+  mutate(pathway.name.short = factor(pathway.name.short, levels = rev(pathway.name.short))) %>%
+  ggplot(aes(x = pathway.name.short, y = -log10(fdr.wilcox), fill = L1)) +
+  geom_hline(yintercept = -log10(.05), colour = "gray60", lty = 3) +
+  geom_bar(stat = "identity", colour = "gray15", width = .5) +
+  scale_fill_manual(values = config$col.briteL1, name = "KEGG L1 brite") +
+  xlab("") + 
+  ylab("-log10(q-value)") +
+  ggtitle("Old/Young differential pathway responses") + 
+  coord_flip() +
+  theme_minimal() +
+  guides(fill = guide_legend(nrow = 3)) + 
+  theme(panel.grid.major.y = element_blank(), 
+        plot.margin = margin(.5, .5, 2, -.2, "cm"),
+        legend.position = c(0.5, -0.3), 
+        legend.key.size = unit(8, "pt"), 
+        legend.text = element_text(size = 8))
+  
+ggsave(paste0(dir.out, "/barplot_wilcox_pathways.png"), units = "in")
+ggsave(paste0(dir.out, "/barplot_wilcox_pathways.svg"), units = "in")
+```
+
+Significant differences through KS test
+
+```{r}
+dplyr::filter(df.wilcoxplot, fdr.ks < 0.05) %>%
+  arrange(pval.ks)
+```
+
+Plot of the fold changes for pathways with $FDR < 0.05$ (Wilcox).
+
+
+```{r}
+list.wilcox <- dplyr::filter(df.wilcoxplot, fdr.wilcox < 0.05) %>%
+  arrange(pval.wilcox) 
+
+df.cpd2name <- df.fc.trt %>%
+  dplyr::select(se, db.id, biomarker) %>%
+  filter(!is.na(db.id)) %>%
+  unique %>%
+  dplyr::rename(original.id = biomarker)
+
+df.plotfc <- plyr::join(
+  dplyr::select(list.wilcox, pathway.kegg.id, pathway.label), 
+  df.wilcox, 
+  type = "inner") %>%
+  plyr::join(df.cpd2name) %>%
+  dplyr::filter(se %in% c("Metabolites", "Lipids"))
+
+write.csv(df.wilcoxplot, 
+          file = paste0(dir.out, "/wilcox_diff_pathways.csv"), 
+          row.names = FALSE)
+write.csv(list.wilcox, 
+          file = paste0(dir.out, "/candidate_diff_pathways.csv"), 
+          row.names = FALSE)
+```
+
+```{r, fig.width=7, fig.height=4}
+ggplot(df.plotfc, aes(x = Old, y = Young)) +
+  geom_point(aes(label0 = original.id, label1 = db.id, label2 = se, colour = se), cex = 1) + 
+  geom_hline(yintercept = 0, colour = "gray70") + 
+  geom_vline(xintercept = 0, colour = "gray70") + 
+  geom_abline(intercept = 0, slope = 1, lty = 2, colour = "gray50", lwd = 1) +
+  geom_smooth(method = "lm", colour = "gray20", se = TRUE) + 
+  scale_colour_manual(values = config$col.omicLM, drop = FALSE, name = "Omic") +
+  stat_poly_eq(formula = y ~ x, 
+               aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+               parse = TRUE) +
+  facet_wrap(~pathway.label, ncol = 2, labeller = label_wrap_gen()) +
+  coord_fixed() + 
+  theme(aspect.ratio = 1) + 
+  xlab("Log2 fold change (old)") + 
+  ylab("Log2 fold change (young)")
+
+ggsave(filename = paste0(dir.out, "/scatter_fc_topdifferences.pdf"))
+ggsave(filename = paste0(dir.out, "/scatter_fc_topdifferences.png"))
+ggsave(filename = paste0(dir.out, "/scatter_fc_topdifferences.svg"))
+```
+
+Same plot with free scales (does not keep 1:1 ratio)
+
+```{r, fig.width=7, fig.height=4}
+gg.fc <- ggplot(df.plotfc, aes(x = Old, y = Young)) +
+  geom_point(aes(label0 = original.id, label1 = db.id, label2 = se, colour = se), cex = 1) + 
+  geom_hline(yintercept = 0, colour = "gray70") + 
+  geom_vline(xintercept = 0, colour = "gray70") + 
+  geom_abline(intercept = 0, slope = 1, lty = 2, colour = "gray50", lwd = 1) +
+  geom_smooth(method = "lm", colour = "gray20", se = TRUE) + 
+  scale_colour_manual(values = config$col.omicLM, drop = FALSE, name = "Omic") +
+  stat_poly_eq(formula = y ~ x, 
+               aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+               parse = TRUE) +
+  facet_wrap(~pathway.label, scales = "free", ncol = 2, labeller = label_wrap_gen()) +
+  
+  theme(aspect.ratio = 1) + 
+  xlab("Log2 fold change (old)") + 
+  ylab("Log2 fold change (young)")
+
+gg.fc
+
+ggsave(filename = paste0(dir.out, "/scatter_fc_topdifferences_freescale.svg"))
+ggsave(filename = paste0(dir.out, "/scatter_fc_topdifferences_freescale.pdf"))
+ggsave(filename = paste0(dir.out, "/scatter_fc_topdifferences_freescale.png"))
+```
+
+
+
+```{r, fig.width=4, fig.height=4}
+dir.scatter <- paste0(dir.out, "/scatter_wilcox")
+unlink(dir.scatter, recursive = TRUE)
+dir.create(dir.scatter)
+
+df.wilcoxplot %>%
+  mutate(rank.int = rank(pval.wilcox, ties.method = "first"), 
+         rank.format = sprintf("%03d", rank.int)) %>%
+ dplyr::select(pathway.kegg.id, pathway.label, rank.format) %>%
+  plyr::join(df.wilcox, type = "inner") %>%
+  plyr::d_ply(
+  "pathway.kegg.id", 
+  function(df) {
+    path.label <- head(df$pathway.label, 1) %>% as.character
+    path.name <- head(df$pathway.name.short, 1) %>% as.character
+    path.rank <- head(df$rank.format, 1) %>% as.character
+    
+    gg.fc <- ggplot(df, aes(x = Old, y = Young)) +
+      geom_point(aes(label1 = db.id, label2 = se, colour = se), cex = 1) + 
+      geom_hline(yintercept = 0, colour = "gray70") + 
+      geom_vline(xintercept = 0, colour = "gray70") + 
+      geom_abline(intercept = 0, slope = 1, lty = 2, colour = "gray50", lwd = 1) +
+      geom_smooth(method = "lm", colour = "gray20", se = TRUE) + 
+      scale_colour_manual(values = config$col.omicLM, drop = FALSE, name = "Omic") +
+      stat_poly_eq(formula = y ~ x, 
+                   aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+                   parse = TRUE) +
+      ggtitle(path.label) +
+      theme(aspect.ratio = 1) + 
+      xlab("Log2 fold change (old)") + 
+      ylab("Log2 fold change (young)")
+    
+    name.file <- stringr::str_trunc(gsub(" ", "", path.name), 20) %>%
+      gsub("/", "|", .)
+    ggsave(gg.fc, filename = paste0(dir.scatter, "/", path.rank, "_", name.file, ".svg"), 
+           width = 5, height = 5, units = "in")
+    ggsave(gg.fc, filename = paste0(dir.scatter, "/", path.rank, "_", name.file, ".png"), 
+           width = 5, height = 5, units = "in")
+  }, .parallel = TRUE
+)
+```
+
+The same plot in an interactive fashion (allows seeing the gene/compound IDs 
+of each data point by hovering).
+
+```{r}
+html.fc <- plotly::ggplotly(gg.fc)
+
+htmlwidgets::saveWidget(html.fc, 
+                        file = "widget_fc.html", 
+                        selfcontained = TRUE, 
+                        title = "Fold changes: old versus young")
+file.rename("widget_fc.html", paste0(dir.out, "/widget_fc.html"))
+```
+
+
+
+# Pathway agreement: Metabolon metab
+
+## Path. agreement (metab lung)
+
+```{r}
+df.wilcoxmetab <- dplyr::filter(df.fc.trt, se == "Metabolites") %>%
+  dplyr::mutate(signif = spval.adj.TRT < q.ref & abs(scoef.TRT) > fc.ref) %>%
+  tidyr::gather("type", "value", scoef.TRT, spval.adj.TRT, signif) %>%
+  reshape2::dcast(biomarker ~ Age + type, value.var = "value") %>%
+  join(df.metabpath, by = "biomarker", type = "left") %>%
+  tidyr::gather("pathway.type", "pathway.name", SUPER_PATHWAY, SUB_PATHWAY) %>%
+  tidyr::unite(oldyoungsignif, Old_signif, Young_signif, sep = "") %>%
+  mutate(label = v.oldyoung.labels[oldyoungsignif]) %>%
+  mutate(label = factor(label, levels = names(v.oldyoung.colors)))
+names(df.wilcoxmetab$label) <- NULL
+
+df.wilcoxmetabplot <- df.wilcoxmetab %>%
+  plyr::ddply(c("pathway.type", "pathway.name"), 
+  function(df.p) {
+    # browser()
+    if (nrow(df.p) < 5) return()
+    
+    wt <- wilcox.test(x = df.p$Old_scoef.TRT, 
+                      y = df.p$Young_scoef.TRT, 
+                      alternative = "two.sided", 
+                      paired = TRUE)
+    ks <- ks.test(x = df.p$Old_scoef.TRT, 
+                  y = df.p$Young_scoef.TRT, 
+                  alternative = "two.sided")
+    
+    data.frame(pval.wilcox = wt$p.value, 
+               pval.ks = ks$p.value, 
+               n = nrow(df.p))
+  } 
+) %>% 
+  group_by(pathway.type) %>%
+  mutate(fdr.wilcox = p.adjust(pval.wilcox, method = "fdr"), 
+         fdr.ks = p.adjust(pval.ks, method = "fdr"), 
+         npathways.fdr = length(pval.ks), 
+         pathway.label = paste0(pathway.name, 
+                                    " (q = ", 
+                                    signif(fdr.wilcox, 3), 
+                                    ")")) 
+```
+
+```{r}
+list.wilcoxmetab <- dplyr::filter(df.wilcoxmetabplot, fdr.wilcox < .05) %>%
+  arrange(pval.wilcox) 
+```
+
+```{r}
+write.csv(df.wilcoxmetabplot, 
+          file = paste0(dir.out, "/wilcox_diff_pathwaysmetab.csv"), 
+          row.names = FALSE)
+write.csv(list.wilcoxmetab, 
+          file = paste0(dir.out, "/candidate_diff_pathwaysmetab.csv"), 
+          row.names = FALSE)
+
+list.wilcoxmetab
+```
+
+Barplot of the top 15 significant pathways
+
+```{r, fig.width=8, fig.height=3}
+# there are non-annotated metabolites whose pathway is NA
+# remove them 
+arrange(df.wilcoxmetabplot, pval.wilcox) %>%
+  dplyr::filter(fdr.wilcox < .05 & !(pathway.type == "SUPER_PATHWAY" & is.na(pathway.name))) %>%
+  head(15) %>%
+  as.data.frame %>%
+  mutate(pathway.name = ifelse(is.na(pathway.name), "Unidentified metabolites", pathway.name), 
+         pathway.name = factor(pathway.name, levels = rev(pathway.name))) %>%
+  ggplot(aes(x = pathway.name, y = -log10(fdr.wilcox), fill = pathway.type)) +
+  geom_bar(stat = "identity", colour = "gray15", width = .5) +
+  scale_fill_manual(values = c("gray40", "gray70")) +
+  xlab("") + 
+  ylab("-log10(q-value)") +
+  ggtitle("Old/Young differential metabolite class response") + 
+  coord_flip() +
+  theme_minimal() +
+  guides(fill = guide_legend(nrow = 1, title = "Pathway type", title.position = "left")) + 
+  theme(panel.grid.major.y = element_blank(), 
+        plot.margin = margin(.5, .5, 1, -.2, "cm"),
+        legend.position = c(0.5, -.3), 
+        legend.key.size = unit(8, "pt"), 
+        legend.text = element_text(size = 8))
+  
+ggsave(paste0(dir.out, "/barplot_wilcoxmetab_pathways.png"), width = 8, height = 3, units = "in")
+ggsave(paste0(dir.out, "/barplot_wilcoxmetab_pathways.svg"), width = 8, height = 3, units = "in")
+ggsave(paste0(dir.out, "/barplot_wilcoxmetab_pathways.pdf"), width = 8, height = 3, units = "in")
+```
+
+Version with 2-line wrappings and only sub-pathways
+
+```{r, fig.width=6.5, fig.height=4}
+arrange(df.wilcoxmetabplot, pval.wilcox) %>%
+  dplyr::filter(pathway.type == "SUB_PATHWAY" & fdr.wilcox < 0.05) %>%
+  arrange(pval.wilcox) %>%
+  as.data.frame %>%
+  mutate(pathway.name = factor(pathway.name, levels = rev(pathway.name))) %>%
+  ggplot(aes(x = pathway.name, y = -log10(fdr.wilcox))) +
+  geom_bar(stat = "identity", fill = "gray40", colour = "gray15", width = .5) +
+  xlab("") + 
+  ylab("-log10(q-value)") +
+  ggtitle("Old/Young differential metabolite class response") + 
+  coord_flip() +
+  scale_x_discrete(labels = scales::wrap_format(35)) +
+  theme_minimal() +
+  guides(fill = guide_legend(nrow = 1, title = "Pathway type", title.position = "left")) + 
+  theme(panel.grid.major.y = element_blank())
+  
+ggsave(paste0(dir.out, "/barplot_wilcoxmetab_pathways_wrapped.png"), width = 6.5, height = 4, units = "in")
+ggsave(paste0(dir.out, "/barplot_wilcoxmetab_pathways_wrapped.svg"), width = 6.5, height = 4, units = "in")
+ggsave(paste0(dir.out, "/barplot_wilcoxmetab_pathways_wrapped.pdf"), width = 6.5, height = 4, units = "in")
+```
+
+Plot of the fold changes for pathways with $FDR < 0.05$ (Wilcox).
+
+```{r, fig.width=9, fig.height=6}
+gg.fcmetab <- plyr::join(
+  df.wilcoxmetab, 
+  dplyr::select(list.wilcoxmetab, pathway.name, pathway.label), 
+  type = "inner") %>%
+  dplyr::filter(pathway.type == "SUB_PATHWAY") %>%
+  ggplot(aes(x = Old_scoef.TRT, 
+             y = Young_scoef.TRT)) +
+  geom_point(aes(label1 = Old_spval.adj.TRT, label2 = Young_spval.adj.TRT, 
+                 label3 = BIOCHEMICAL,
+                 colour = label)) + 
+  geom_hline(yintercept = 0, colour = "gray70") + 
+  geom_vline(xintercept = 0, colour = "gray70") + 
+  geom_abline(intercept = 0, slope = 1, lty = 2, colour = "gray50", lwd = 1) +
+  geom_smooth(method = "lm", colour = "gray20", se = TRUE) + 
+  scale_color_manual(values = v.oldyoung.colors, name = "Significant") + 
+  stat_poly_eq(formula = y ~ x, 
+               aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+               parse = TRUE) +
+  facet_wrap(~pathway.label, nrow = 2, 
+             labeller = label_wrap_gen(width = 40)) + 
+  xlab("Log2 fold change (old)") +
+  ylab("Log2 fold change (young)") +
+  coord_fixed() + 
+  theme(aspect.ratio = 1, 
+        strip.text.x = element_text(size = 8))
+
+gg.fcmetab %T>% 
+  ggsave(filename = paste0(dir.out, "/scatter_fc_metabolon.metab.svg"))
+```
+
+Write all the scatterplots
+
+```{r}
+dir.scattermetab <- paste0(dir.out, "/scatterplots_wilcoxmetab")
+unlink(dir.scattermetab, recursive = TRUE)
+dir.create(dir.scattermetab)
+
+df.wilcoxmetabplot %>%
+  ungroup %>%
+  mutate(rank.int = rank(pval.wilcox, ties.method = "first"), 
+         rank.format = sprintf("%03d", rank.int)) %>%
+  dplyr::select(pathway.name, pathway.label, rank.format) %>%
+  plyr::join(df.wilcoxmetab, type = "inner") %>%
+  plyr::d_ply(
+  "pathway.name", 
+  function(df) {
+    # browser()
+    
+    path.label <- head(df$pathway.label, 1) %>% as.character %>%
+      strwrap(width = 45) %>% paste(collapse = "\n")
+    path.name <- head(df$pathway.name, 1) %>% as.character 
+    path.rank <- head(df$rank.format, 1) %>% as.character
+    
+    gg.fclipid <- ggplot(df, aes(x = Old_scoef.TRT, y = Young_scoef.TRT)) +
+      geom_point(aes(colour = label)) + 
+      geom_hline(yintercept = 0, colour = "gray70") + 
+      geom_vline(xintercept = 0, colour = "gray70") + 
+      geom_abline(intercept = 0, slope = 1, lty = 2, colour = "gray50", lwd = 1) +
+      geom_smooth(method = "lm", colour = "gray20", se = TRUE) + 
+      scale_color_manual(values = v.oldyoung.colors, name = "Significant", drop = FALSE) + 
+      stat_poly_eq(formula = y ~ x, 
+                   aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+                   parse = TRUE) +
+      xlab("Log2 fold change (old)") +
+      ylab("Log2 fold change (young)") +
+      ggtitle(path.label) +
+      coord_fixed() + 
+      theme_bw() +
+      theme(aspect.ratio = 1)
+      
+    name.file <- stringr::str_trunc(gsub(" ", "", path.name), 20) %>%
+      gsub("/", "|", .)
+    ggsave(gg.fclipid, filename = paste0(dir.scattermetab, "/", path.rank, "_", name.file, ".svg"), 
+           width = 5, height = 5, units = "in")
+    ggsave(gg.fclipid, filename = paste0(dir.scattermetab, "/", path.rank, "_", name.file, ".png"), 
+           width = 5, height = 5, units = "in")
+  }, .parallel = TRUE
+)
+```
+
+```{r}
+html.fcmetab <- plotly::ggplotly(
+  gg.fcmetab + facet_wrap(~pathway.name+pathway.type, nrow = 2))
+
+htmlwidgets::saveWidget(html.fcmetab, 
+                        file = "widget_fcmetab.html", 
+                        selfcontained = TRUE, 
+                        title = "Metabolite fold changes: old versus young")
+file.rename("widget_fcmetab.html", paste0(dir.out, "/widget_fcmetab.html"))
+```
+
+
+# Metabolon agreement Metabolon lipid
+
+Differences between old and young mice within the 
+Metabolon lipids pathways were quantified through the fold 
+change agreement method used above.
+
+```{r}
+df.wilcoxlipid <- dplyr::filter(df.fc.trt, se == "Lipids") %>%
+  dplyr::mutate(signif = spval.adj.TRT < q.ref & abs(scoef.TRT) > fc.ref) %>%
+  tidyr::gather("type", "value", scoef.TRT, spval.adj.TRT, signif) %>%
+  reshape2::dcast(biomarker ~ Age + type, value.var = "value") %>%
+  join(df.lipidpath, by = "biomarker", type = "left") %>%
+  tidyr::gather("pathway.type", "pathway.name", SUPER_PATHWAY, SUB_PATHWAY) %>%
+  tidyr::unite(oldyoungsignif, Old_signif, Young_signif, sep = "") %>%
+  mutate(label = v.oldyoung.labels[oldyoungsignif]) %>%
+  mutate(label = factor(label, levels = names(v.oldyoung.colors)))
+names(df.wilcoxlipid$label) <- NULL
+
+
+df.wilcoxlipidplot <- df.wilcoxlipid %>%
+  plyr::ddply(c("pathway.type", "pathway.name"), 
+  function(df.p) {
+    # browser()
+    if (nrow(df.p) < 5) return()
+    
+    wt <- wilcox.test(x = df.p$Old_scoef.TRT, 
+                      y = df.p$Young_scoef.TRT, 
+                      alternative = "two.sided", 
+                      paired = TRUE)
+    ks <- ks.test(x = df.p$Old_scoef.TRT, 
+                  y = df.p$Young_scoef.TRT, 
+                  alternative = "two.sided")
+    
+    data.frame(pval.wilcox = wt$p.value, 
+               pval.ks = ks$p.value, 
+               n = nrow(df.p))
+  } 
+) %>% 
+  group_by(pathway.type) %>%
+  mutate(fdr.wilcox = p.adjust(pval.wilcox, method = "fdr"), 
+         fdr.ks = p.adjust(pval.ks, method = "fdr"), 
+         npathways.fdr = length(pval.ks), 
+         pathway.label = paste0(pathway.name, 
+                                    " (q = ", 
+                                    signif(fdr.wilcox, 3), 
+                                    ")")) 
+```
+
+```{r}
+list.wilcoxlipid <- dplyr::filter(df.wilcoxlipidplot, fdr.wilcox < 0.05) %>%
+  arrange(pval.wilcox) 
+```
+
+Plot barplot with the significant sub-pathways:
+
+```{r, fig.width=5, fig.height=4}
+arrange(df.wilcoxlipidplot, pval.wilcox) %>%
+  dplyr::filter(pathway.type == "SUB_PATHWAY" & fdr.wilcox < 0.05) %>%
+  arrange(pval.wilcox) %>%
+  as.data.frame %>%
+  mutate(pathway.name = factor(pathway.name, levels = rev(pathway.name))) %>%
+  ggplot(aes(x = pathway.name, y = -log10(fdr.wilcox))) +
+  geom_bar(stat = "identity", fill = "gray40", colour = "gray15", width = .5) +
+  xlab("") + 
+  ylab("-log10(q-value)") +
+  ggtitle("Old/Young differential lipid class response") + 
+  coord_flip() +
+  theme_minimal() +
+  guides(fill = guide_legend(nrow = 1, title = "Pathway type", title.position = "left")) + 
+  theme(panel.grid.major.y = element_blank())
+  
+ggsave(paste0(dir.out, "/barplot_wilcoxlipid_pathways.png"), width = 5, height = 4, units = "in")
+ggsave(paste0(dir.out, "/barplot_wilcoxlipid_pathways.svg"), width = 5, height = 4, units = "in")
+```
+
+Table containing pathways with $FDR < 0.05$
+
+```{r}
+write.csv(df.wilcoxlipidplot, 
+          file = paste0(dir.out, "/wilcox_diff_pathwayslipids.csv"), 
+          row.names = FALSE)
+write.csv(list.wilcoxlipid, 
+          file = paste0(dir.out, "/candidate_diff_pathwayslipids.csv"), 
+          row.names = FALSE)
+
+list.wilcoxlipid
+```
+
+Plot of the fold changes for pathways with $FDR < 10^{-6}$ (Wilcox).
+
+```{r, fig.width=9, fig.height=9}
+gg.fclipid <- plyr::join(
+  dplyr::filter(dplyr::ungroup(df.wilcoxlipidplot), fdr.wilcox < 1e-4), 
+  df.wilcoxlipid, 
+  type = "inner") %>%
+  dplyr::filter(pathway.type == "SUB_PATHWAY") %>%
+  ggplot(aes(x = Old_scoef.TRT, 
+             y = Young_scoef.TRT)) +
+  geom_point(aes(label1 = Old_spval.adj.TRT, label2 = Young_spval.adj.TRT, 
+                 label3 = BIOCHEMICAL,
+                 colour = label)) + 
+  geom_hline(yintercept = 0, colour = "gray70") + 
+  geom_vline(xintercept = 0, colour = "gray70") + 
+  geom_abline(intercept = 0, slope = 1, lty = 2, colour = "gray50", lwd = 1) +
+  geom_smooth(method = "lm", colour = "gray20", se = TRUE) + 
+  scale_color_manual(values = v.oldyoung.colors, name = "Significant") + 
+  stat_poly_eq(formula = y ~ x, 
+               aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+               parse = TRUE) +
+  facet_wrap(~pathway.label, ncol = 3) +
+  xlab("Log2 fold change (old)") +
+  ylab("Log2 fold change (young)") +
+  coord_fixed() + 
+  theme(aspect.ratio = 1)
+
+gg.fclipid %T>% 
+  ggsave(filename = paste0(dir.out, "/scatter_fc_metabolon_lipid.svg"))
+```
+
+Write all the scatterplots
+
+```{r}
+dir.scatterlipid <- paste0(dir.out, "/scatterplots_wilcoxlipid")
+unlink(dir.scatterlipid, recursive = TRUE)
+dir.create(dir.scatterlipid)
+
+df.wilcoxlipidplot %>%
+  ungroup %>%
+  mutate(rank.int = rank(pval.wilcox, ties.method = "first"), 
+         rank.format = sprintf("%03d", rank.int)) %>%
+  dplyr::select(pathway.name, pathway.label, rank.format) %>%
+  plyr::join(df.wilcoxlipid, type = "inner") %>%
+  plyr::d_ply(
+  "pathway.name", 
+  function(df) {
+    # browser()
+    
+    path.label <- head(df$pathway.label, 1) %>% as.character
+    path.name <- head(df$pathway.name, 1) %>% as.character 
+    path.rank <- head(df$rank.format, 1) %>% as.character
+    
+    gg.fclipid <- ggplot(df, aes(x = Old_scoef.TRT, y = Young_scoef.TRT)) +
+      geom_point(aes(colour = label)) + 
+      geom_hline(yintercept = 0, colour = "gray70") + 
+      geom_vline(xintercept = 0, colour = "gray70") + 
+      geom_abline(intercept = 0, slope = 1, lty = 2, colour = "gray50", lwd = 1) +
+      geom_smooth(method = "lm", colour = "gray20", se = TRUE) + 
+      scale_color_manual(values = v.oldyoung.colors, name = "Significant", drop = FALSE) + 
+      stat_poly_eq(formula = y ~ x, 
+                   aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+                   parse = TRUE) +
+      xlab("Log2 fold change (old)") +
+      ylab("Log2 fold change (young)") +
+      ggtitle(path.label) +
+      coord_fixed() + 
+      theme_bw() +
+      theme(aspect.ratio = 1)
+      
+    name.file <- stringr::str_trunc(gsub(" ", "", path.name), 20) %>%
+      gsub("/", "|", .)
+    ggsave(gg.fclipid, filename = paste0(dir.scatterlipid, "/", path.rank, "_", name.file, ".svg"), 
+           width = 5, height = 5, units = "in")
+    ggsave(gg.fclipid, filename = paste0(dir.scatterlipid, "/", path.rank, "_", name.file, ".png"), 
+           width = 5, height = 5, units = "in")
+  }, .parallel = TRUE
+)
+```
+
+
+```{r}
+html.fclipid <- plotly::ggplotly(
+  gg.fclipid + facet_wrap(~pathway.label+pathway.type, nrow = 2))
+
+htmlwidgets::saveWidget(html.fclipid, 
+                        file = "widget_fclipid.html", 
+                        selfcontained = TRUE, 
+                        title = "Lipid fold changes: old versus young")
+file.rename("widget_fclipid.html", paste0(dir.out, "/widget_fclipid.html"))
+```
+
+# Reproducibility
+
+```{r}
+date()
+```
+
+```{r}
+sessionInfo()
+```
+
+
+

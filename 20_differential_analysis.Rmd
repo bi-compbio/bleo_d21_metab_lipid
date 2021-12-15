@@ -1,0 +1,378 @@
+---
+title: "Stratified differential abundance - metabolomics and lipidomics"
+author: "Sergio Picart-Armada"
+date: "8th March, 2020"
+output:
+  html_document:
+    toc: TRUE
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, 
+                      error = FALSE, warning = FALSE, 
+                      fig.height = 4)
+```
+
+# Loading the data
+
+```{r cars}
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(magrittr)
+
+library(SummarizedExperiment)
+library(MultiAssayExperiment)
+
+library(ggplot2)
+library(ggpmisc)
+library(plotly)
+# library(GGally)
+# library(corrplot)
+library(psych)
+
+# library(pls)
+# library(pcaMethods)
+# library(emmeans)
+
+library(data.table)
+# library(UpSetR)
+
+# library(clusterProfiler)
+# library(KEGGREST)
+# library(pathview)
+
+# metabolomics
+# library(FELLA)
+# library(igraph)
+
+# library(pheatmap)
+
+config <- new.env()
+source("config.R", local = config)
+source("helpers.R")
+
+# load all the omics data
+mae <- readRDS(config$out.mae)
+
+theme_set(theme_bw())
+
+futile.logger::flog.threshold(futile.logger::ERROR, name = "VennDiagramLogger")
+
+if (!dir.exists(config$dir.differential)) dir.create(config$dir.differential)
+
+set.seed(1)
+```
+
+## Sanity checks
+
+```{r}
+plyr::l_ply(experiments(mae), 
+       function(se) stopifnot(levels(colData(se)$TRT)[2] == "Bleo")
+)
+plyr::l_ply(experiments(mae), 
+       function(se) stopifnot(levels(colData(se)$AGE)[2] == "21M")
+)
+
+lapply(experiments(mae), 
+       function(se) levels(colData(se)$TRT))
+lapply(experiments(mae), 
+       function(se) levels(colData(se)$AGE))
+
+# check sample mapping concistency
+# if this breaks down, check sampleMap(mae)
+mae[, colData(mae)$AnimalID]
+```
+
+Use chemical names for better readability
+
+
+```{r}
+
+rownames(experiments(mae)$Lipids) <- rowData(experiments(mae)$Lipids)$BIOCHEMICAL
+rownames(experiments(mae)$Metabolites) <- rowData(experiments(mae)$Metabolites)$BIOCHEMICAL
+
+```
+
+# Treatment
+
+## Fit models - treatment
+
+### Classical lm
+
+Markers are guaranteed to lie in logarithmic scale. 
+After stratifying by age, they are selected using the model:
+
+$$ y \sim TRT$$
+
+After the models were fit, 
+
+* `log2fc` was computed as the coefficient for `TRTBleo`, 
+because the data already lies in log2 scale
+* The `p.value`s come from an `anova` (classical lms) or 
+`limma::makeContrasts` (using `limma`)
+* Multiple test correction: `fdr`
+
+
+```{r}
+# omit the formula argument to use y~x
+df.lm <- plyr::ddply(
+  as.data.frame(colData(mae)), "Age", function(df.age) {
+    mapply(compute_pvals_lfcs, 
+      mae[, df.age$AnimalID], 
+      var.fc = "TRT", 
+      SIMPLIFY = FALSE
+    ) %>% plyr::ldply(identity, .id = "se")
+  }
+) 
+```
+
+## Differential entities summary
+
+Significant entities at $FDR < `r config$q.ref`$ and $|\log_2(FC)| > `r config$fc.ref`$ 
+
+### Classical lm
+
+```{r}
+mutate(df.lm, signif = spval.adj.TRT < config$q.ref & abs(scoef.TRT) > config$fc.ref) %>%
+  group_by(Age, se) %>% 
+  summarise(label = paste(sum(signif), length(signif), sep = "/")) %>%
+  tidyr::spread(Age, label)
+```
+### Limma
+
+```{r}
+df.limma <- plyr::ddply(
+  as.data.frame(colData(mae)), "Age", function(df.age) {
+    mapply(limma_pvals_lfcs, 
+      mae[, df.age$AnimalID], 
+      MoreArgs = list(
+        var.fc = "TRT", 
+        formula.design = ~TRT, 
+        robut = TRUE,
+        format.like.lm = TRUE), 
+      SIMPLIFY = FALSE
+    ) %>% plyr::ldply(identity, .id = "se")
+  }
+)
+```
+
+```{r}
+mutate(df.limma, signif = spval.adj.TRT < config$q.ref & abs(scoef.TRT) > config$fc.ref) %>%
+  group_by(Age, se) %>% 
+  summarise(label = paste(sum(signif), length(signif), sep = "/")) %>%
+  tidyr::spread(Age, label)
+```
+
+### P-value distributions
+
+Because of the low amount of DE entities in serum, we displayed their p-value distributions.
+Regular lm:
+
+```{r, fig.width=5}
+ggplot(df.lm, aes(x = spval.TRT)) +
+  geom_histogram() +
+  facet_grid(Age~se) 
+```
+
+Summaries of the q-value distributions:
+
+```{r}
+plyr::ddply(df.lm, c("se", "Age"), function(x) summary(na.omit(x$spval.adj.TRT)))
+```
+
+
+Limma:
+
+```{r, fig.width=5}
+ggplot(df.limma, aes(x = spval.TRT)) +
+  geom_histogram() +
+  facet_grid(Age~se)
+```
+
+Summaries of the q-value distributions:
+
+```{r}
+plyr::ddply(df.limma, c("se", "Age"), function(x) summary(na.omit(x$spval.adj.TRT)))
+```
+
+
+### Final combination
+
+Chose `lm` since `limma` assumes comparable variances across markers.
+
+```{r}
+df.fc <- mutate(df.lm, signif = spval.adj.TRT < config$q.ref & abs(scoef.TRT) > config$fc.ref)
+write.csv(df.fc, config$df.fc.trt, row.names = FALSE)
+```
+
+Number of missing values in p-values
+
+```{r}
+sum(is.na(df.fc$spval.adj.TRT))
+```
+
+## Statistical checks
+
+Ideas: for each linear model...
+
+* Check normality of residuals: Shapiro-Wilk test on the model residuals
+* Check homoscedasticity: F-test on the group variances
+
+P-values must be adjusted since we are performing many tests.
+The following function does the dirty work
+
+```{r}
+# for each marker...
+# fit LM
+# get residuals
+# compare variances
+df.lmdata <- plyr::ddply(
+  as.data.frame(colData(mae)), "Age", function(df.age) {
+    mapply(compute_statistics_lfcs, 
+      mae[, df.age$AnimalID], 
+      var.fc = "TRT", 
+      SIMPLIFY = FALSE
+    ) %>% plyr::ldply(identity, .id = "se")
+  }
+) 
+```
+
+### Shapiro-Wilk test (Normality)
+
+How many markers are significant at FDR < `r config$q.ref`?
+Meaning that we reject that their residuals follow a normal distribution.
+
+```{r}
+mutate(df.lmdata, signif = fdr.shapiro.TRT < config$q.ref) %>%
+  group_by(Age, se) %>% 
+  summarise(label = paste(sum(signif, na.rm = TRUE), length(signif), sep = "/")) %>%
+  tidyr::spread(Age, label)
+```
+Overall
+
+```{r}
+mutate(df.lmdata, signif = fdr.shapiro.TRT < config$q.ref) %>%
+  summarise(Overall = paste(sum(signif, na.rm = TRUE), length(signif), sep = "/"))
+```
+
+### Levene's test (homoscedascitity)
+
+See `?car::leveneTest`
+Fox, J. (2016) Applied Regression Analysis and Generalized Linear Models, Third Edition. Sage. levene test
+
+```{r}
+mutate(df.lmdata, signif = fdr.ltest.TRT < config$q.ref) %>%
+  group_by(Age, se) %>% 
+  summarise(label = paste(sum(signif, na.rm = TRUE), length(signif), sep = "/")) %>%
+  tidyr::spread(Age, label)
+```
+Overall
+
+```{r}
+mutate(df.lmdata, signif = fdr.ltest.TRT < config$q.ref) %>%
+  summarise(Overall = paste(sum(signif, na.rm = TRUE), length(signif), sep = "/"))
+```
+
+### F-test (Homoscedascitity)
+
+How many markers are significant at FDR < `r config$q.ref`?
+Meaning that we reject that the variances of bleo and control are equal.
+
+```{r}
+mutate(df.lmdata, signif = fdr.ftest.TRT < config$q.ref) %>%
+  group_by(Age, se) %>% 
+  summarise(label = paste(sum(signif, na.rm = TRUE), length(signif), sep = "/")) %>%
+  tidyr::spread(Age, label)
+```
+
+### Breusch-Pagan test (homoscedasticity in linear model)
+
+See `?lmtest::bptest`
+T.S. Breusch & A.R. Pagan (1979), A Simple Test for Heteroscedasticity and Random Coefficient Variation. Econometrica 47, 1287–1294
+R. Koenker (1981), A Note on Studentizing a Test for Heteroscedasticity. Journal of Econometrics 17, 107–112.
+
+```{r}
+mutate(df.lmdata, signif = fdr.bptest.TRT < config$q.ref) %>%
+  group_by(Age, se) %>% 
+  summarise(label = paste(sum(signif, na.rm = TRUE), length(signif), sep = "/")) %>%
+  tidyr::spread(Age, label)
+```
+
+
+
+# Age
+
+## Fit models 
+
+We will use directly regular lms.
+
+```{r}
+# omit the formula argument to use y~x
+df.lm.age <- plyr::ddply(
+  as.data.frame(colData(mae)), "Treatment", function(df.trt) {
+    mapply(compute_pvals_lfcs, 
+      mae[, df.trt$AnimalID], 
+      var.fc = "AGE", 
+      SIMPLIFY = FALSE
+    ) %>% plyr::ldply(identity, .id = "se")
+  }
+) 
+```
+
+Significant entities at $FDR < `r config$q.ref`$ and $|\log_2(FC)| > `r config$fc.ref`$ 
+
+```{r}
+mutate(df.lm.age, signif = spval.adj.AGE < config$q.ref & abs(scoef.AGE) > config$fc.ref) %>%
+  group_by(Treatment, se) %>% 
+  summarise(label = paste(sum(signif), length(signif), sep = "/")) %>%
+  tidyr::spread(Treatment, label)
+```
+
+Number of missing values in p-values
+
+```{r}
+sum(is.na(df.lm.age$spval.adj.AGE))
+```
+
+### P-value distributions
+
+
+```{r, fig.width=5}
+ggplot(df.lm.age, aes(x = spval.AGE)) +
+  geom_histogram() +
+  facet_grid(Treatment~se) 
+```
+
+Summaries of the q-value distributions:
+
+```{r}
+plyr::ddply(df.lm.age, c("se", "Treatment"), function(x) summary(na.omit(x$spval.adj.AGE)))
+```
+
+### Export table
+
+Chose `lm`, as for treatment fold changes.
+
+```{r}
+df.fc.age <- mutate(df.lm.age, signif = spval.adj.AGE < config$q.ref & abs(scoef.AGE) > config$fc.ref)
+write.csv(df.fc.age, config$df.fc.age, row.names = FALSE)
+```
+
+
+
+# Reproducibility
+
+```{r}
+date()
+```
+
+```{r}
+sessionInfo()
+```
+
+
+

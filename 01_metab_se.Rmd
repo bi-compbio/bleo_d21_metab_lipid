@@ -1,0 +1,368 @@
+---
+title: "met_lung_sumExp"
+author: "Francesc Fernandez"
+date: "2/12/2019"
+output: html_document
+---
+
+#Summary
+
+This script converts the lung Metabolomics dataset we received from Metabolon and saves the relevant information as a SummarizedExperiment object for later use. The main steps include:     
+     
+* Importing and parsing the data and metadata from the original xls file
+* PCA plot of the raw data using the top 100 most variable metabolites
+* NA imputation
+* PCA plot of the data (log + NA imputed)
+* Linear models with interaction
+* PLS model
+* Mapping metabolites to KEGG pathways
+* Export results to SummarizedExperiment object
+
+
+#Data processing
+##Loading libraries
+
+```{r setup, include=FALSE}
+library(xlsx)
+library(pcaMethods)
+library(ggplot2)
+library(pls)
+library(pheatmap)
+library(KEGGREST)
+library(GGally)
+library(magrittr)
+
+config <- new.env()
+source("config.R", config)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Loading data
+
+```{r, loading metabolomics data}
+
+data.met.lung.raw <- read.xlsx(config$file.metab.lung, sheetName = "OrigScale")
+
+```
+
+##Parsing metadata
+
+```{r, extracting the data read-outs and the metadata for the lung}
+meta.data.met.lung <- data.frame(t(data.met.lung.raw[1:14, -c(1:12)]))
+colnames(meta.data.met.lung) <- as.matrix(meta.data.met.lung[1,])
+meta.data.met.lung <- meta.data.met.lung[-1, ]
+meta.data.met.lung$AGE <- factor(meta.data.met.lung$AGE, levels = c("3M", "21M"))
+meta.data.met.lung$TRT <- factor(meta.data.met.lung$TRT, levels = c("CTRL", "Bleo"))
+
+
+
+data.met.lung.varInfo <- data.met.lung.raw[-c(1:14), ][, 1:13]
+colnames(data.met.lung.varInfo) <- as.character(as.matrix(data.met.lung.varInfo[1, ]))  
+data.met.lung.varInfo <- data.met.lung.varInfo[-1, ]
+data.met.lung.varInfo <- data.frame(metabolite.id = paste0("MetLung", 1:nrow(data.met.lung.varInfo)),
+                                    data.met.lung.varInfo)
+rownames(data.met.lung.varInfo) <- data.met.lung.varInfo$metabolite.id
+
+
+
+
+data.met.lung <- data.met.lung.raw[-c(1:15), ][, -c(1:13)]
+data.met.lung <- apply(data.met.lung, 2, as.numeric)
+rownames(data.met.lung) <- data.met.lung.varInfo$metabolite.id
+
+
+```
+
+##PCA model
+
+```{r}
+
+ind.var.met.lung.top100 <- head(order(apply(t(data.met.lung), 2, var), decreasing = TRUE), 100)
+
+mod.pca.lung.top100.raw <- pca(t(data.met.lung)[, ind.var.met.lung.top100],
+                               scale = "uv",
+                               nPcs = 10,
+                               cv = "q2")
+
+
+scores.pca.lung.top100.raw <- data.frame(pcaMethods::scores(mod.pca.lung.top100.raw)[, 1:3],
+                                     TRT = meta.data.met.lung$TRT,
+                                     AGE = meta.data.met.lung$AGE)
+
+ggplot(scores.pca.lung.top100.raw, aes(x = PC1, y = PC2, colour = TRT, shape = AGE)) + geom_point(size = 2) + scale_shape_manual(values=c(1, 16)) + theme_minimal() + ggtitle("Raw PCA plot")
+
+```
+
+##NA imputation
+
+NAs are imputed in a per metabolite basis. We use the minimum value for each metabolite to impute the NAs. We also take the log2 of the intensities after imputation.
+
+```{r}
+
+dat.met.lung <- t(data.met.lung)
+
+v.nas <- is.na(dat.met.lung) %>%
+  colMeans %>%
+  sort 
+v.keep <- names(v.nas)[v.nas < .5]
+
+dat.met.lung.imp <- apply(dat.met.lung[, v.keep], 2, function(x){
+                        replace(x, is.na(x), min(na.omit(x)))
+}) %>% t
+
+
+dat.met.lung.imp.log <- log2(1 +  dat.met.lung.imp)
+
+
+```
+
+
+
+```{r}
+
+ind.var.met.lung.top100.log <- head(order(apply(t(dat.met.lung.imp.log), 2, var), decreasing = TRUE), 100)
+
+mod.pca.lung.top100.log <- pca(t(dat.met.lung.imp.log)[, ind.var.met.lung.top100.log],
+                           scale = "uv",
+                           nPcs = 10,
+                           cv = "q2")
+scores.pca.lung.top100.log <- data.frame(pcaMethods::scores(mod.pca.lung.top100.log)[, 1:3],
+                                     TRT = meta.data.met.lung$TRT,
+                                     AGE = meta.data.met.lung$AGE)
+
+ggplot(scores.pca.lung.top100.log, aes(x = PC1, y = PC2, colour = TRT, shape = AGE)) + geom_point(size = 2) + scale_shape_manual(values=c(1, 16)) + theme_minimal() + ggtitle("Raw PCA plot")
+
+```
+
+## Making PLS models with the imputed data
+
+The objective here was to see whether we can use the metabolomics data to separate the 4 groups (Bleo/NaCl and old/young). We also wanted to find out if there are specific patterns in the data that are specific of one or a subgroup of the 4 classes (e.g. is there a pattern when goign from Bleo to NaCL that is only found in old animals or viceversa?)
+
+
+```{r}
+
+model.matrix.lung.met <- model.matrix( ~ TRT * AGE, 
+                                       data = meta.data.met.lung)[, -1]
+
+mod.pls.lung.raw <- plsr(model.matrix.lung.met ~ t(dat.met.lung.imp.log),
+                         scale = TRUE,
+                         validation = "LOO",
+                         jackknife = TRUE,
+                         ncomp = 10)
+
+mod.pls.lung.int <- plsr(model.matrix( ~ TRT : AGE, data = meta.data.met.lung)[, which(apply(apply(model.matrix( ~ TRT : AGE, data = meta.data.met.lung), 2, diff),2, function(x){length(unique(x))}) > 1)] ~ t(dat.met.lung.imp.log),
+                         scale = TRUE,
+                         validation = "LOO",
+                         jackknife = TRUE,
+                         ncomp = 10)
+
+mod.pls.lung.scores <- as.data.frame(pls::scores(mod.pls.lung.raw)[, 1:3])
+colnames(mod.pls.lung.scores) <- c("comp1", "comp2", "comp3")
+mod.pls.lung.scores.int <- as.data.frame(pls::scores(mod.pls.lung.int)[, 1:3])
+colnames(mod.pls.lung.scores.int) <- c("comp1", "comp2", "comp3")
+
+ggpairs(data = mod.pls.lung.scores.int,
+        aes(colour = interaction(meta.data.met.lung$TRT,
+                                 meta.data.met.lung$AGE))) + theme_minimal()
+
+ggplot(mod.pls.lung.scores.int, aes(x = comp1,
+                                    y = comp2,
+                                    colour = interaction(meta.data.met.lung$TRT,
+                                                         meta.data.met.lung$AGE))) + geom_point()
+
+```
+
+
+```{r}
+
+# k <- keggGet("hsa04216")
+# 
+# met.ids.path <- as.character(data.met.lung.varInfo[na.omit(match(names(k[[1]]$COMPOUND), data.met.lung.varInfo$KEGG)), ]$metabolite.id)
+# 
+# a <- pca(t(dat.met.lung.imp.log[met.ids.path, ]),
+#          cv = "q2",
+#          scale = "uv",
+#          nPcs = 5)
+
+```
+
+## Fitting linear models with interaction term and extracting p-vals and FCs
+
+```{r}
+
+mod.lms <- apply(dat.met.lung.imp.log, MARGIN = 1, function(metabolite){
+                  lm(metabolite ~ meta.data.met.lung$AGE * meta.data.met.lung$TRT)
+})
+
+mod.lms.anova <- lapply(mod.lms, anova)
+mod.lms.pvals <- t(sapply(mod.lms.anova, function(mod){matrix(mod[c("meta.data.met.lung$AGE", "meta.data.met.lung$TRT", "meta.data.met.lung$AGE:meta.data.met.lung$TRT"), ]$Pr, ncol = 1)}))
+colnames(mod.lms.pvals) <- c("AGE", "TRT", "AGE.TRT")
+mod.lms.pvals.adj <- data.frame(apply(mod.lms.pvals, 2, function(x){p.adjust(x, method = "fdr")}))
+
+mod.lm.coefs <- t(sapply(mod.lms, coef))[,-1]
+colnames(mod.lm.coefs) <- paste("coef", sapply(strsplit(colnames(mod.lm.coefs), "$", fixed = TRUE), function(x){if(length(x)>2){"AGE.TRT"}else{x[2]}}), sep = ".")
+colnames(mod.lm.coefs) <- gsub("Bleo|21M", "", colnames(mod.lm.coefs))
+
+lFC <- apply(dat.met.lung.imp, 1, function(met){
+              FCs.AGE <- aggregate(as.numeric(met), list(meta.data.met.lung$AGE), mean)
+              FCs.AGE <- FCs.AGE[FCs.AGE$Group.1 == "21M", "x"] / FCs.AGE[FCs.AGE$Group.1 == "3M", "x"]
+              FCs.TRT <- aggregate(as.numeric(met), list(meta.data.met.lung$TRT), mean)
+              FCs.TRT <- FCs.TRT[FCs.TRT$Group.1 == "Bleo", "x"] / FCs.TRT[FCs.TRT$Group.1 == "CTRL", "x"]
+              
+              return(data.frame(lFC.AGE = log2(FCs.AGE), lFC.TRT = log2(FCs.TRT)))
+  
+  })
+lFCl <- apply(dat.met.lung.imp.log, 1, function(met){
+              FCs.AGE <- aggregate(as.numeric(met), list(meta.data.met.lung$AGE), mean)
+              FCs.AGE <- FCs.AGE[FCs.AGE$Group.1 == "21M", "x"] - FCs.AGE[FCs.AGE$Group.1 == "3M", "x"]
+              FCs.TRT <- aggregate(as.numeric(met), list(meta.data.met.lung$TRT), mean)
+              FCs.TRT <- FCs.TRT[FCs.TRT$Group.1 == "Bleo", "x"] - FCs.TRT[FCs.TRT$Group.1 == "CTRL", "x"]
+              
+              return(data.frame(lFCl.AGE = FCs.AGE, lFCl.TRT = FCs.TRT))
+  
+  })
+
+lFC <- do.call(rbind, lFC)
+lFCl <- do.call(rbind, lFCl)
+
+# write.table(file = "lung_treatmentMet_0_05.txt", matrix(as.character(na.omit(data.met.lung.varInfo[rownames(mod.lms.pvals.adj)[which(mod.lms.pvals.adj$TRT <= 0.05)], ]$KEGG)), ncol = 1), row.names = FALSE, col.names = FALSE, quote = FALSE)
+# 
+# 
+# write.table(file = "lung_AgeMet_0_05.csv", matrix(as.character(na.omit(data.met.lung.varInfo[rownames(mod.lms.pvals.adj)[which(mod.lms.pvals.adj$AGE <= 0.05)], ]$KEGG)), ncol = 1), row.names = FALSE, col.names = FALSE, quote = FALSE)
+# 
+# write.table(file = "/data/cb_projects/user/fernafra/workspace/projects/Bleomycin_Model_all/data/BleoModel/AgeMet_0_1.csv", matrix(as.character(na.omit(data.met.lung.varInfo[rownames(mod.lms.pvals.adj)[which(mod.lms.pvals.adj$AGE <= 0.1)], ]$KEGG)), ncol = 1), row.names = FALSE, col.names = FALSE, quote = FALSE)
+# 
+# write.table(file = "/data/cb_projects/user/fernafra/workspace/projects/Bleomycin_Model_all/data/BleoModel/treatmentAgeMet_0_05.csv", matrix(as.character(na.omit(data.met.lung.varInfo[rownames(mod.lms.pvals.adj)[which(mod.lms.pvals.adj$TRT.AGE <= 0.05)], ]$KEGG)), ncol = 1), row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+
+```
+
+
+```{r, running limma contrasts}
+
+# library(limma)
+# meta.data.met.lung.valNam <- meta.data.met.lung
+# meta.data.met.lung.valNam$AGE <- as.factor(make.names(meta.data.met.lung.valNam$AGE))
+# meta.data.met.lung.valNam$TRT <- factor(meta.data.met.lung.valNam$TRT)
+# 
+# meta.data.met.lung.valNam$TRT <- relevel(meta.data.met.lung.valNam$TRT, "CTRL")
+# meta.data.met.lung.valNam$AGE <- relevel(meta.data.met.lung.valNam$AGE, "X3M")
+# 
+# meta.data.met.lung.valNam$group <- interaction(meta.data.met.lung.valNam$TRT,
+#                                                 meta.data.met.lung.valNam$AGE)
+# 
+# limma.fit <- lmFit((dat.met.lung.imp.log),
+#                    design = model.matrix(~ 0 + group, data = meta.data.met.lung.valNam))
+# 
+# # colnames(limma.fit$coefficients) <- c("(Intercept)", sapply(colnames(limma.fit)[-1], function(x){substr(x, start = 4, stop = nchar(x))}))
+# 
+# contrasts.lung <- makeContrasts(contrasts = c("(groupCTRL.X3M + groupCTRL.X21M)/2  - (groupBleo.X3M + groupBleo.X21M)/2", 
+#                                                "(groupCTRL.X3M + groupBleo.X3M)/2  - (groupCTRL.X21M + groupBleo.X21M)/2",
+#                                                "(groupCTRL.X3M + groupCTRL.X21M) - (groupBleo.X3M + groupBleo.X21M)"),
+#                                  levels = c( "groupCTRL.X3M", "groupBleo.X3M", "groupCTRL.X21M", "groupBleo.X21M"))
+# 
+# 
+# contr<- contrasts.fit(fit = limma.fit,
+#                       contrasts = contrasts.lung)
+# 
+# contr.bayes <- eBayes(contr)
+```
+
+
+
+## Getting KEGG pathway annotation for each metabolite
+
+When a metabolite does not have a known KEGG ID, the reported pathways will be NA
+
+```{r, generating the mapped pathways for mouse, warning=FALSE}
+
+path.mouse <- KEGGREST::keggList("pathway", organism = "mmu")
+path.human <- KEGGREST::keggList("pathway", organism = "hsa")
+# 
+# path.mouse <- data.table::fread(config$file.kegg.mmu.list, header = FALSE)
+# path.mouse <- setNames(path.mouse$V1, path.mouse$V2)
+# 
+# path.human <- data.table::fread(config$file.kegg.mmu.list, header = FALSE) 
+# path.human <- setNames(path.human$V1, path.human$V2)
+
+# cpd.human <- KEGGREST::keggList("cpd", organism = "hsa")
+# path.ids.mouse <- substr(sapply(strsplit(names(path.mouse), ":"), function(x){x[2]}), start = 4, stop = 8)
+# path.ids.human <- substr(sapply(strsplit(names(path.human), ":"), function(x){x[2]}), start = 4, stop = 8)
+
+
+data.met.lung.varInfo.exp <- data.frame(data.met.lung.varInfo[rownames(dat.met.lung.imp), ],
+                                        pval     = mod.lms.pvals,
+                                        pval.adj = mod.lms.pvals.adj)
+
+
+kegg.path.cpd <- keggLink("pathway", "cpd")
+
+kegg.path.cpd <- data.table::fread(config$file.kegg.mmu.cpd, header = FALSE) 
+kegg.path.cpd <- setNames(kegg.path.cpd$V1, kegg.path.cpd$V2)
+
+kegg.path.cpd.df <- sapply(data.met.lung.varInfo.exp$KEGG, function(met){
+  
+  if(!is.na(met)){
+    
+  paste0("path:mmu", sapply(sapply(strsplit(kegg.path.cpd[grep(met, names(kegg.path.cpd))], ":"), function(x)x[2]), function(y){substr(y, start = 4, stop = nchar(y))}))  
+   
+    
+  }else{
+    ""
+  }
+})
+
+cross.cpd.path <- sapply(kegg.path.cpd.df, function(pl){
+  if(pl != ""){
+    paste(sapply(strsplit(path.mouse[which(names(path.mouse) %in% pl)], " - "), function(x)x[1]), collapse = "|")
+  }else{
+    NA
+  }
+})
+
+cross.cpd.id <- sapply(kegg.path.cpd.df, function(pl) {
+  if (pl == "") return(NA)
+  pl.mmu <- intersect(pl, names(path.mouse))
+  paste(gsub("path:", "", pl.mmu), collapse = "|")
+})
+```
+
+## Exporting the results in a SummarizedExperiment object
+
+
+```{r, creating summarised experiment object for the lung data}
+
+library(SummarizedExperiment)
+
+
+data.met.lung.varInfo.exp <- data.frame(data.met.lung.varInfo[rownames(dat.met.lung.imp), ],
+                                        pval     = mod.lms.pvals,
+                                        pval.adj = mod.lms.pvals.adj,
+                                        pathway.kegg.id = cross.cpd.id,
+                                        pathway.kegg.shortname = as.character(cross.cpd.path),
+                                        mod.lm.coefs,
+                                        lFC,
+                                        lFCl)
+# fix strange name in HMDB column
+names(data.met.lung.varInfo.exp)[grepl("Group\\.HMDB", names(data.met.lung.varInfo.exp))] <- "Group.HMDB"
+
+se.met.lung <- SummarizedExperiment(assays = list("metab.lung.imp.log" = dat.met.lung.imp.log,
+                                                  "metab.lung.raw"     = data.met.lung[rownames(dat.met.lung.imp), ]),
+                                    rowData = data.met.lung.varInfo.exp,
+                                    colData = meta.data.met.lung)
+
+if (!dir.exists(config$dir.metab)) dir.create(config$dir.metab)
+saveRDS(se.met.lung, file = config$file.metab.se)
+
+``` 
+
+## Reproducibility
+
+```{r}
+date()
+```
+
+```{r}
+sessionInfo()
+```

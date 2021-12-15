@@ -1,0 +1,209 @@
+---
+title: "Descriptive statistics"
+author: Sergio Picart-Armada
+date: "20th May, 2019"
+output:
+  html_document:
+    toc: TRUE
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, error = FALSE, warning = FALSE, fig.height = 4, fig.width = 4)
+```
+
+## Loading the data
+
+```{r cars}
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(magrittr)
+library(SummarizedExperiment)
+library(MultiAssayExperiment)
+
+library(ggplot2)
+library(grid)
+library(cowplot)
+
+library(pcaMethods)
+
+library(data.table)
+library(UpSetR)
+
+config <- new.env()
+source("config.R", local = config)
+
+source("helpers.R")
+
+# load all the omics data
+mae <- readRDS(config$out.mae)
+
+if (!dir.exists(config$dir.descriptive)) dir.create(config$dir.descriptive)
+
+theme_set(theme_bw())
+```
+
+# Metabolomics
+
+```{r}
+se.metab <- experiments(mae)$Metabolites
+```
+
+## Descriptive
+
+Number of samples: `r ncol(se.metab)`
+Number of features: `r nrow(se.metab)`
+
+Features
+
+```{r}
+rowData(se.metab)[, 1:5]
+```
+
+How many are not annotated? (those starting with `X - `)
+
+```{r}
+grepl("X - ", rowData(se.metab)$BIOCHEMICAL) %>% sum
+```
+
+Same ones that don't have a super pathway:
+
+```{r}
+sum(is.na(rowData(se.metab)$SUPER_PATHWAY))
+```
+
+How many are annotated?
+
+```{r}
+grepl("X - ", rowData(se.metab)$BIOCHEMICAL) %>% not %>% sum
+```
+
+## PCA
+
+
+```{r}
+gg.metab <- summarise_dataset(
+  mae, "Metabolites", 
+  quote.aes = aes(shape = AgeTreatment, colour = AgeTreatment), 
+  return.interim = TRUE)
+
+# to extract the legend
+gg.metab$gg.obj <- gg.metab$gg.obj +
+  scale_colour_manual(values = config$col.agetrt, name = "Group") +
+  scale_shape_manual(values = config$pch.agetrt, name = "Group") +
+  config$ggtheme
+
+ggplot(gg.metab$df.plot, aes(x = PC1, y = PC2, shape = AgeTreatment, colour = AgeTreatment)) +
+  geom_hline(yintercept = 0, lty = 2, lwd = .3) +
+  geom_vline(xintercept = 0, lty = 2, lwd = .3) +
+  geom_point(size = .5) +
+  coord_fixed() +
+  xlab(gg.metab$names.pc[1]) +
+  ylab(gg.metab$names.pc[2]) +
+  scale_colour_manual(values = config$col.agetrt.noalpha, name = "Group") +
+  scale_shape_manual(values = config$pch.agetrt, name = "Group") +
+  scale_x_continuous(limits = get_limits_square(gg.metab$gg.obj)) +
+  scale_y_continuous(limits = get_limits_square(gg.metab$gg.obj)) +
+  ggtitle(paste0("Metabolites - ", nrow(se.metab), " features")) +
+  theme(legend.position = "none") +
+  # theme(panel.grid.minor = element_line(size = 0.2), panel.grid.major = element_line(size = .35))
+  config$ggtheme
+
+
+ggsave(filename = paste0(config$dir.descriptive, "/pca_metabolites.svg"), height = config$pca.inches, width = config$pca.inches)
+ggsave(filename = paste0(config$dir.descriptive, "/pca_metabolites.png"), height = config$pca.inches, width = config$pca.inches)
+ggsave(filename = paste0(config$dir.descriptive, "/pca_metabolites.pdf"), height = config$pca.inches, width = config$pca.inches)
+```
+
+Plot legend only
+
+```{r, fig.width=1, fig.height=1.5}
+# https://stackoverflow.com/questions/12041042/how-to-plot-just-the-legends-in-ggplot2
+gg.legend <- cowplot::get_legend(gg.metab$gg.obj)
+
+grid::grid.newpage()
+grid::grid.draw(gg.legend)
+
+ggsave(plot = gg.legend, filename = paste0(config$dir.descriptive, "/pca_legend.svg"), height = 1.5, width = 1)
+ggsave(plot = gg.legend, filename = paste0(config$dir.descriptive, "/pca_legend.png"), height = 1.5, width = 1)
+ggsave(plot = gg.legend, filename = paste0(config$dir.descriptive, "/pca_legend.pdf"), height = 1.5, width = 1)
+```
+
+
+
+
+# Lipidomics
+
+```{r}
+se.lipid <- experiments(mae)$Lipids
+```
+
+Number of samples: `r ncol(se.lipid)`
+Number of features: `r nrow(se.lipid)`
+
+Features:
+
+```{r}
+rowData(se.lipid)[, 1:10]
+```
+How many are not annotated? (those starting with `X - `)
+
+```{r}
+grepl("X - ", rowData(se.lipid)$BIOCHEMICAL) %>% sum
+```
+
+Same ones that don't have a super pathway:
+
+```{r}
+sum(is.na(rowData(se.lipid)$SUPER_PATHWAY))
+```
+
+How many are annotated?
+
+```{r}
+grepl("X - ", rowData(se.lipid)$BIOCHEMICAL) %>% not %>% sum
+```
+
+## PCA
+
+
+```{r}
+gg.lipid <- summarise_dataset(
+  mae, "Lipids", 
+  quote.aes = aes(shape = Treatment, colour = Age), 
+  return.interim = TRUE) 
+
+ggplot(gg.lipid$df.plot, aes(x = PC1, y = PC2, shape = AgeTreatment, colour = AgeTreatment)) +
+  geom_hline(yintercept = 0, lty = 2, lwd = .3) +
+  geom_vline(xintercept = 0, lty = 2, lwd = .3) +
+  geom_point(size = .5) +
+  coord_fixed() +
+  xlab(gg.lipid$names.pc[1]) +
+  ylab(gg.lipid$names.pc[2]) +
+  scale_colour_manual(values = config$col.agetrt.noalpha, name = "Group") +
+  scale_shape_manual(values = config$pch.agetrt, name = "Group") +
+  scale_x_continuous(limits = get_limits_square(gg.lipid$gg.obj)) +
+  scale_y_continuous(limits = get_limits_square(gg.lipid$gg.obj)) +
+  ggtitle(paste0("Lipids - ", nrow(se.lipid), " features")) +
+  theme(legend.position = "none") +
+  # theme(panel.grid.minor = element_line(size = 0.2), panel.grid.major = element_line(size = .35))
+  config$ggtheme
+
+ggsave(filename = paste0(config$dir.descriptive, "/pca_lipids.svg"), height = config$pca.inches, width = config$pca.inches)
+ggsave(filename = paste0(config$dir.descriptive, "/pca_lipids.png"), height = config$pca.inches, width = config$pca.inches)
+ggsave(filename = paste0(config$dir.descriptive, "/pca_lipids.pdf"), height = config$pca.inches, width = config$pca.inches)
+```
+
+
+## Reproducibility
+
+```{r}
+date()
+```
+
+```{r}
+sessionInfo()
+```

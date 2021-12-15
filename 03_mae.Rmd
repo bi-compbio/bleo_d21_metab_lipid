@@ -1,0 +1,195 @@
+---
+title: "Bleomycin cross-sectional data formatting"
+author: Sergio Picart-Armada
+date: "20th May, 2019"
+output:
+  html_document:
+    toc: TRUE
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, error = FALSE, warning = FALSE)
+```
+
+## Loading the data
+
+```{r cars}
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(magrittr)
+library(SummarizedExperiment)
+library(MultiAssayExperiment)
+library(ggplot2)
+library(pcaMethods)
+
+library(data.table)
+library(UpSetR)
+
+config <- new.env()
+source("config.R", local = config)
+
+# load all the omics data
+env.se <- new.env()
+local({
+  Metabolites <- readRDS(config$file.metab.se)
+  Lipids <- readRDS(config$file.lipid.se)
+}, env.se)
+
+theme_set(theme_bw())
+```
+
+```{r}
+# Load the phenotypes
+```
+
+
+## Defining a `MultiAssayExperiment` object
+
+From their vignette, the `MultiAssayExperiment` constructor function can take three arguments:
+
+1. experiments - An ExperimentList or list of data
+2. colData - A DataFrame describing the patients (or cell lines, or other biological units)
+3. sampleMap - A DataFrame of assay, primary, and colname identifiers
+
+### Experiments
+
+They are already available from the original `rds` files.
+
+### sampleMap: add the same `AnimalID` column to every `colData` 
+
+```{r}
+with(env.se, {
+  # browser()
+
+  colnames(Metabolites) <- colData(Metabolites)$AnimalID <- paste0(config$id.prefix, 
+                                          colData(Metabolites)$ANIMAL_ID)
+  
+  # rownames(Metabolites) <- rowData(Metabolites)$BIOCHEMICAL
+
+  colnames(Lipids) <- colData(Lipids)$AnimalID <- paste0(config$id.prefix, 
+                                          colData(Lipids)$ANIMAL_ID)
+  
+  # rownames(Lipids) <- rowData(Lipids)$BIOCHEMICAL
+})
+
+df.map <- lapply(env.se, function(se) {
+  cd <- colData(se)
+  data.frame(primary = cd$AnimalID, 
+             colname = rownames(cd), 
+             stringsAsFactors = FALSE)
+}) %>% listToMap
+```
+
+Seems like `MultiAssayExperiment` will only take the first assay in every `SummarizedExperiment` object.
+Therefore, we must ensure we are picking the preprocessed ones.
+
+```{r}
+sapply(env.se, function(se) length(assays(se)))
+assays(env.se$Metabolites)
+```
+
+In the metabolomics assays, we will get rid of the `raw` data.
+
+```{r}
+with(env.se, {
+  assays(Metabolites)$metab.lung.raw <- NULL
+})
+```
+
+
+
+### colData: clean and add the phenotypes
+
+
+### Build the `MultiAssayExperiment` object
+
+Check sample mappings
+
+```{r}
+all(colnames(env.se$Lipids) %in% df.map$colname)
+all(colnames(env.se$Metabolites) %in% df.map$colname)
+
+all(colData(env.se$Lipids)$AnimalID %in% df.map$primary)
+all(colData(env.se$Metabolites)$AnimalID %in% df.map$primary)
+all(rownames(df.pheno) %in% df.map$primary)
+```
+
+```{r}
+setdiff(rownames(df.pheno), df.map$primary)
+```
+
+```{r}
+# mae <- MultiAssayExperiment(experiments = ExperimentList(as.list(env.se)))
+# sampleMap(mae)$primary <- df.map$primary
+# # harmonizing input:
+# #   removing 56 sampleMap rows with 'primary' not in colData
+# #   removing 56 colData rownames not in sampleMap 'primary'
+# 
+# 
+# mae <- MultiAssayExperiment(experiments = ExperimentList(as.list(env.se)), colData = df.pheno)
+```
+
+Would the `BIOCHEMICAL` column give proper rownames?
+`make.names()` will add periods instead of whitespaces, not ideal...
+
+```{r}
+setdiff(make.names(rowData(env.se$Lipids)$BIOCHEMICAL), rowData(env.se$Lipids)$BIOCHEMICAL) %>% head
+```
+
+
+```{r}
+# had painful issues with the samples mapping correctly
+# specifically, intersectColumns(mae) giving 0 columns
+# and the mae having 0 columns in both SEs
+# 
+# Solution: convert df.pheno to data.frame again and set rownames (it was a DFrame)
+mae <- MultiAssayExperiment(experiments = ExperimentList(as.list(env.se)), 
+                            colData = df.pheno,
+                            sampleMap = df.map)
+mae
+```
+
+## Basic inspection of the `MultiAssayExperiment` object
+
+As expected, metabolomics has one less sample (28) than transcriptomics and proteomics (29).
+Indeed, the 28 samples are common across the datasets.
+
+```{r}
+upsetSamples(mae)
+```
+
+```{r}
+assays(mae)
+```
+
+What does the `colData` look like in each omic study?
+
+```{r}
+lapply(experiments(mae), function(se) dim(colData(se)))
+```
+
+And the `rowData`?
+
+```{r}
+lapply(experiments(mae), function(se) dim(rowData(se)))
+```
+
+```{r}
+if (!dir.exists(config$dir.mae)) dir.create(config$dir.mae)
+saveRDS(mae, file = config$out.mae, compress = "xz")
+```
+
+
+## Reproducibility
+
+```{r}
+date()
+```
+
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,250 @@
+---
+title: "Lipidomics data analysis"
+author: "Sergi Picart"
+date: "3/6/2019"
+output:
+  html_document:
+    toc: TRUE
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+## Summary
+
+This script converts the lung lipidomics dataset we received from Metabolon and saves the relevant information as a SummarizedExperiment object for later use. The main steps include:     
+     
+* Importing and parsing the data and metadata from the original xls file
+* PCA plot of the raw data
+* Export results to SummarizedExperiment objects
+
+## Data processing
+
+```{r setup, include=FALSE}
+library(pcaMethods)
+library(ggplot2)
+library(pheatmap)
+
+library(plyr)
+library(dplyr)
+
+library(magrittr)
+
+# biohelpeR
+library(SummarizedExperiment)
+library(MultiAssayExperiment)
+
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+
+config <- new.env()
+source("config.R", config)
+
+```
+
+### KEGG pathways
+
+```{r}
+path.mouse <- KEGGREST::keggList("pathway", organism = "mmu") %>%
+  set_names(gsub("path:", "", names(.))) %>%
+  gsub(" - Mus.+", "", .)
+link.mouse <- KEGGREST::keggLink("pathway", "cpd") %>%
+  set_names(gsub("cpd:", "", names(.))) %>%
+  gsub("path:map", "mmu", .) %>%
+  subset(. %in% names(path.mouse)) %>%
+  split(names(.))
+
+list.kegg.pathid <- sapply(link.mouse, paste, collapse = "|")
+
+list.kegg.pathname <- sapply(
+  link.mouse, function(cpd) {
+    paste(path.mouse[cpd], collapse = "|") 
+  }
+)
+```
+
+
+### Lung
+
+```{r}
+lip.lung <- metabolon2dfs(config$file.lipid.lung, marker.prefix = "LipLung", sample.prefix = "LL_")
+
+# testing metabolon2dfs2() function
+# lip.lung <- metabolon2dfs2(file.lipid.lung, 
+#                            marker.prefix = "LipLung", 
+#                            sample.prefix = "LL_", 
+#                            sheet = "ScaledImpData", 
+#                            range.rowdata = "A19:G1045", 
+#                            range.coldata = "H1:AJ18", 
+#                            return.se = F)
+
+# Add the kegg/hmdb mappings
+df.aux <- readxl::read_excel(config$file.auxlipid.lung, skip = 7, 
+                             sheet = "Pathway Heat Map") %>%
+  dplyr::select(`Comp ID`, KEGG, HMDB) %>%
+  dplyr::rename(COMP_ID = `Comp ID`) %>% 
+  plyr::join(lip.lung$rowdata, by = "COMP_ID", type = "right") %>%
+  dplyr::mutate(pathway.kegg.id = list.kegg.pathid[KEGG], 
+         pathway.kegg.shortname = list.kegg.pathname[KEGG]) %>%
+  set_rownames(.$rownames) 
+  
+
+lip.lung$rowdata <- df.aux
+rm(df.aux)
+```
+
+```{r}
+df.hist.lung <- tibble::tibble(original = as.vector(as.matrix(lip.lung$assay)), 
+                          log2 = log2(original), 
+                          log2plus1 = log2(original + 1)) %>%
+  reshape2::melt()
+
+ggplot(df.hist.lung, aes(x = value)) +
+  geom_histogram() +
+  facet_wrap(~variable, scales = "free_x") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+```
+
+```{r}
+se.lip.lung <- local({
+    assay <- as.matrix(lip.lung$assay)
+    assay.log <- log2(assay)
+    
+    coldata <- lip.lung$coldata %>%
+      dplyr::mutate(TRT = relevel(factor(TRT), "CTRL"), 
+             AGE = relevel(factor(AGE), "3M"))
+    
+    # fold changes
+    grp.trt <- split(rownames(lip.lung$coldata), coldata$TRT)
+    grp.age <- split(rownames(lip.lung$coldata), coldata$AGE)
+    
+    df.fc <- data.frame(
+      lFC.AGE = log2(rowMeans(assay[, grp.age$`21M`]) / rowMeans(assay[, grp.age$`3M`])),
+      lFC.TRT = log2(rowMeans(assay[, grp.trt$Bleo]) / rowMeans(assay[, grp.trt$CTRL])),
+      lFCl.AGE = rowMeans(assay.log[, grp.age$`21M`]) - rowMeans(assay.log[, grp.age$`3M`]),
+      lFCl.TRT = rowMeans(assay.log[, grp.trt$Bleo]) - rowMeans(assay.log[, grp.trt$CTRL])
+    )
+    
+    # linear models, coef, anova
+    mod.lms <- apply(assay.log, MARGIN = 1, function(metabolite){
+                      lm(metabolite ~ coldata$AGE * coldata$TRT)
+    })
+    
+    mod.lms.anova <- lapply(mod.lms, anova)
+    mod.lms.pvals <- t(sapply(
+      mod.lms.anova, 
+      function(mod)
+        {matrix(mod[c("coldata$AGE", "coldata$TRT", "coldata$AGE:coldata$TRT"), ]$Pr, ncol = 1)
+        }))
+    colnames(mod.lms.pvals) <- paste0("pval.", c("AGE", "TRT", "AGE.TRT"))
+    mod.lms.pvals.adj <- data.frame(apply(mod.lms.pvals, 2, function(x){p.adjust(x, method = "fdr")}))
+    colnames(mod.lms.pvals) <- paste0("pval.adj.", c("AGE", "TRT", "AGE.TRT"))
+    
+    mod.lm.coefs <- t(sapply(mod.lms, coef))[,-1]
+    colnames(mod.lm.coefs) <- paste(
+      "coef", 
+      sapply(strsplit(colnames(mod.lm.coefs), "$", fixed = TRUE), function(x)
+        {if(length(x)>2){"AGE21M.TRTBleo"}else{x[2]}
+        }), sep = ".")
+    colnames(mod.lm.coefs) <- gsub("Bleo|21M", "", colnames(mod.lm.coefs))
+
+    
+    rowdata <- data.frame(
+      lip.lung$rowdata, 
+      mod.lms.pvals, 
+      mod.lm.coefs, 
+      df.fc)
+  
+  
+    se.lip.lung <- SummarizedExperiment(assays = list(lip.lung.imp.log = assay.log),
+                                      colData = DataFrame(coldata), 
+                                      rowData = DataFrame(rowdata))
+    
+    se.lip.lung
+})
+```
+
+
+### Lipid contents
+
+```{r}
+if (!dir.exists(config$dir.lipid)) dir.create(config$dir.lipid)
+
+saveRDS(se.lip.lung, 
+     file = config$file.lipid.se, 
+     compress = "xz")
+```
+
+
+```{r}
+se.lipclass.concentration.lung <- metabolon2dfs2(
+  config$file.auxlipid.lung, sheet = "Lipid Class Concentrations",
+  marker.prefix = "LipClassConLung", 
+  sample.prefix = "LCconL_", 
+  id.rowname = "CLIENT IDENTIFIER", 
+  range.rowdata = "A24:B39", 
+  range.coldata = "C6:AE23")
+
+saveRDS(se.lipclass.concentration.lung, 
+     file = paste0(config$dir.lipid, "se_lipclass_lung_concentration.rds"), 
+     compress = "xz")
+
+se.lipclass.composition.lung <- metabolon2dfs2(
+  config$file.auxlipid.lung, sheet = "Lipid Class Compositions",
+  marker.prefix = "LipClassComLung", 
+  sample.prefix = "LCcomL_", 
+  id.rowname = "CLIENT IDENTIFIER", 
+  range.rowdata = "A24:B39", 
+  range.coldata = "C6:AE23")
+
+saveRDS(se.lipclass.composition.lung, 
+     file = paste0(config$dir.lipid, "se_lipclass_lung_composition.rds"), 
+     compress = "xz")
+
+se.lipspecies.concentration.lung <- metabolon2dfs2(
+  config$file.auxlipid.lung, sheet = "Species Concentrations",
+  marker.prefix = "LipSpeciesConLung", 
+  sample.prefix = "LSconL_", 
+  id.rowname = "CLIENT IDENTIFIER", 
+  range.rowdata = "A24:B1040", 
+  range.coldata = "C6:AE23")
+
+saveRDS(se.lipspecies.concentration.lung, 
+     file = paste0(config$dir.lipid, "se_lipspecies_lung_concentration.rds"), 
+     compress = "xz")
+
+se.lipspecies.composition.lung <- metabolon2dfs2(
+  config$file.auxlipid.lung, sheet = "Species Compositions",
+  marker.prefix = "LipSpeciesComLung", 
+  sample.prefix = "LScomL_", 
+  id.rowname = "CLIENT IDENTIFIER", 
+  range.rowdata = "A24:B1040", 
+  range.coldata = "C6:AE23")
+
+saveRDS(se.lipspecies.composition.lung, 
+     file = paste0(config$dir.lipid, "se_lipspecies_lung_composition.rds"), 
+     compress = "xz")
+
+```
+
+
+## Descriptive statistics
+
+### Lung
+
+
+```{r}
+summarise_dataset(se.lip.lung, quote.aes = aes(color = AGE, pch = TREATMENT))
+```
+
+
+## Reproducibility
+
+```{r}
+date()
+```
+
+```{r}
+sessionInfo()
+```
+

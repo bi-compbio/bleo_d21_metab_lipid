@@ -1,0 +1,1456 @@
+---
+title: "Stratified differential abundance - metabolomics and lipidomics"
+author: "Sergio Picart-Armada"
+date: "8th March, 2020"
+output:
+  html_document:
+    toc: TRUE
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, 
+                      error = FALSE, warning = FALSE, 
+                      fig.height = 4)
+```
+
+# Loading the data
+
+```{r cars}
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(magrittr)
+
+library(SummarizedExperiment)
+library(MultiAssayExperiment)
+
+library(ggplot2)
+library(ggpmisc)
+library(ggpubr)
+library(rstatix)
+library(plotly)
+# library(GGally)
+# library(corrplot)
+library(psych)
+
+# library(pls)
+# library(pcaMethods)
+# library(emmeans)
+
+library(data.table)
+# library(UpSetR)
+
+library(clusterProfiler)
+
+# metabolomics
+library(FELLA)
+library(igraph)
+
+library(pheatmap)
+
+config <- new.env()
+source("config.R", local = config)
+source("helpers.R")
+
+# load all the omics data
+mae <- readRDS(config$out.mae)
+
+theme_set(theme_bw())
+
+futile.logger::flog.threshold(futile.logger::ERROR, name = "VennDiagramLogger")
+
+dir.out <- config$dir.diffplots
+if (!dir.exists(dir.out)) dir.create(dir.out)
+
+set.seed(1)
+```
+
+
+```{r}
+fc.ref <- config$fc.ref
+q.ref <- config$q.ref
+```
+
+## Sanity checks
+
+```{r}
+plyr::l_ply(experiments(mae), 
+       function(se) stopifnot(levels(colData(se)$TRT)[2] == "Bleo")
+)
+plyr::l_ply(experiments(mae), 
+       function(se) stopifnot(levels(colData(se)$AGE)[2] == "21M")
+)
+
+lapply(experiments(mae), 
+       function(se) levels(colData(se)$TRT))
+lapply(experiments(mae), 
+       function(se) levels(colData(se)$AGE))
+
+# check sample mapping concistency
+# if this breaks down, check sampleMap(mae)
+mae[, colData(mae)$AnimalID]
+```
+
+Use chemical names for better readability
+
+
+```{r}
+
+rownames(experiments(mae)$Lipids) <- rowData(experiments(mae)$Lipids)$BIOCHEMICAL
+rownames(experiments(mae)$Metabolites) <- rowData(experiments(mae)$Metabolites)$BIOCHEMICAL
+
+```
+
+
+Load fold changes
+
+```{r}
+df.fc.trt <- read.csv(config$df.fc.trt) %>%
+  mutate(Age = factor(Age, levels = names(config$col.age)), 
+         se = factor(se, levels = names(config$col.omic)))
+```
+
+Prepare sumexp for metabolites
+
+```{r}
+se.met <- mae[["Metabolites"]]
+# labels
+se.met$Age = factor(ifelse(se.met$AGE == "3M", "Young", "Old"), levels = names(config$col.age))
+se.met$Treatment = factor(ifelse(se.met$TRT == "Bleo", "Bleo", "NaCl"), levels = names(config$col.trt))
+se.met$Group = factor(paste0(se.met$Age, " ", se.met$Treatment), levels = names(config$col.agetrt))
+# reorder
+se.met <- se.met[, order(se.met$Treatment, se.met$Age)]
+# add signif
+rowData(se.met)$signif <- ifelse(rowData(se.met)$pval.adj.TRT < .05, "p<0.05", "p>=0.05")
+```
+
+Prepare sumexp for lipids
+
+```{r, fig.width=7, fig.height=7}
+se.lip <- mae[["Lipids"]]
+# labels
+se.lip$Age = factor(ifelse(se.lip$AGE == "3M", "Young", "Old"), levels = names(config$col.age))
+se.lip$Treatment = factor(ifelse(se.lip$TRT == "Bleo", "Bleo", "NaCl"), levels = names(config$col.trt))
+# reorder
+se.lip <- se.lip[, order(se.lip$Treatment, se.lip$Age)]
+
+
+lip.nonctt <- (assay(se.lip) %>% apply(1, sd)) > 0
+```
+
+## Literature annotations
+
+Load excel files with literature annotations 
+
+```{r}
+file.literature <- "00_dataraw/literature/Kang2016_DirectionChange.xlsx"
+df.annot.kang <- readxl::read_excel(file.literature, sheet = 1, n_max = 61, na = c("N.A.", ""))
+# check everything was read
+# stopifnot(tail(df.annot.kang$Metabolite, 1) == "Glutamine")
+# exclude non-measured metabolites
+df.annot.kang %<>% subset(`Metabolon name` != "Not measured")
+```
+
+Mapping?
+
+```{r}
+intersect(df.annot.kang$Metabolite, rowData(se.met)$BIOCHEMICAL)
+```
+
+Ignoring the case?
+
+```{r}
+list.match <- lapply(paste0("^", df.annot.kang$Metabolite, "$"), 
+                     grep, rowData(se.met)$BIOCHEMICAL, value = TRUE, ignore.case = TRUE)
+
+# at most 1 hit per metabolite?
+stopifnot(all(sapply(list.match, length) <= 1))
+
+# fill in NAs
+list.match[sapply(list.match, length) == 0] <- NA
+
+# add to original file
+df.annot.kang.mapped <- dplyr::rename(df.annot.kang, DirectionKang = `Direction IPF/Ctrl`, FDRKang = FDR) %>%
+  mutate(logFCKang = log2(`IPF mean`), 
+         SignifKang = FDRKang < .05, 
+         SignifKang = ifelse(is.na(SignifKang), FALSE, SignifKang))
+df.annot.kang.mapped$Metabolon <- unlist(list.match)
+
+```
+
+Have a look at the mappings
+
+```{r}
+dplyr::select(df.annot.kang.mapped, Metabolite, Metabolon)
+```
+
+Number of correct mappings
+
+```{r}
+sum(!is.na(df.annot.kang.mapped$Metabolon))
+```
+Proportion of correct mappings
+
+```{r}
+mean(!is.na(df.annot.kang.mapped$Metabolon))
+```
+
+After discussions, Jelena matched manually the metabolites to our Metabolon names.
+Mapping:
+
+```{r}
+intersect(df.annot.kang$`Metabolon name`, rowData(se.met)$BIOCHEMICAL)
+```
+
+Mismatchings:
+
+```{r}
+setdiff(df.annot.kang$`Metabolon name`, rowData(se.met)$BIOCHEMICAL)
+```
+
+The mapping greatly improves, so we will use this one.
+
+```{r}
+df.annot.kang.mapped %<>% dplyr::rename(BIOCHEMICAL = `Metabolon name`, PvalueKang = pvalue)
+```
+
+
+## Custom metabolic pathways
+
+Load excel files with personalized pathways
+
+```{r}
+xlsx.custommaps <- "00_dataraw/literature/Tables_Newstructure_v3.xlsx"
+# list tabs
+v.custommaps <- readxl::excel_sheets(xlsx.custommaps)
+# exclude some tabs
+v.custommaps <- grep("Tabelle1|Plasmalogens|Glutathione", v.custommaps, value = TRUE, invert = TRUE)
+
+# names (strip whitespaces)
+# names(v.custommaps) <- paste0(seq_along(v.custommaps), "_", gsub(" $", "", v.custommaps))
+names(v.custommaps) <- gsub(" $", "", v.custommaps)
+names(v.custommaps) <- gsub("NEW ", "", v.custommaps)
+
+v.custommaps
+```
+
+### List pathways
+
+```{r}
+# limit to column G and 100 entities
+# Then discard everything after the 1st NA in the Metabolite column
+list.custommaps.df <- lapply(v.custommaps, readxl::read_excel, path = xlsx.custommaps, range = "A1:G100") %>%
+  lapply(function(df) {
+    # first NA
+    rw <- head(which(is.na(df$Metabolite)), 1)
+    # all until 1st NA
+    df[seq_len(rw - 1), ]
+  })
+
+```
+
+Mapping? (metabolites)
+First show metabolites, per pathway
+
+```{r}
+lapply(list.custommaps.df, extract2, "Metabolite") 
+```
+Define which tabs belong to lipids (rest to metabolites)
+
+```{r}
+lip.custommaps <- grep("Total lipids", names(list.custommaps.df), value = TRUE)
+met.custommaps <- setdiff(names(list.custommaps.df), lip.custommaps)
+```
+
+### Metabolites
+
+Mismatchings
+
+```{r}
+# common
+list.custommaps.met <- lapply(list.custommaps.df[met.custommaps], extract2, "Metabolite") %>%
+  lapply(intersect, rownames(se.met))
+# mismatching
+lapply(list.custommaps.df[met.custommaps], extract2, "Metabolite") %>%
+  lapply(setdiff, rownames(se.met))
+```
+### Lipids
+
+Mismatchings
+
+```{r}
+# common
+list.custommaps.lip <- lapply(list.custommaps.df[lip.custommaps], extract2, "Metabolite") %>%
+  lapply(intersect, rownames(se.lip))
+# mismatching
+lapply(list.custommaps.df[lip.custommaps], extract2, "Metabolite") %>%
+  lapply(setdiff, rownames(se.lip))
+```
+
+
+
+# Descriptive statistics
+
+
+
+# Differential Plots
+
+## Scatterplots
+
+```{r, fig.width=7, fig.height=4}
+# # myspread spreads multiple columns 
+# v.oldyoung.labels <- c("00" = "None", "10" = "Old", "01" = "Young", "11" = "Both")
+# v.oldyoung.colors <- setNames(
+#   c("gray85", config$col.age["Old"], config$col.age["Young"], "#C09393"), 
+#   v.oldyoung.labels
+# )
+
+df.fc.scatter <- dplyr::select(df.fc.trt, Age, se, biomarker, scoef.TRT, signif) %>%
+  myspread(Age, c(scoef.TRT, signif)) %>% 
+  tidyr::unite(oldyoungsignif, Old_signif, Young_signif, sep = "") %>%
+  mutate(label = factor(config$v.oldyoung.labels[oldyoungsignif], levels = config$v.oldyoung.labels)) %>%
+  arrange(oldyoungsignif) ##%>%
+  #left_join(env.export$df.map)
+  
+gg.fc.scatter <- ggplot(df.fc.scatter, aes(x = Old_scoef.TRT, y = Young_scoef.TRT, label1 = biomarker)) +
+  geom_hline(yintercept = 0, colour = "gray70") + 
+  geom_vline(xintercept = 0, colour = "gray70") + 
+  geom_point(aes(colour = label), cex = .85, alpha = .6, pch = 16) + 
+  geom_abline(intercept = 0, slope = 1, lty = 2, colour = "gray50", lwd = 1) +
+  geom_smooth(method = "lm", colour = "gray40", se = TRUE) + 
+  scale_colour_manual(values = config$v.oldyoung.colors, name = "Significant") +
+  stat_poly_eq(formula = y ~ x, 
+               aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+               parse = TRUE) +
+  facet_wrap(~se, nrow = 1) +
+  coord_fixed() + 
+  theme(aspect.ratio = 1) + 
+  guides(colour = guide_legend(override.aes = list(size = 5))) +
+  xlab("Log2 fold change (old)") + 
+  ylab("Log2 fold change (young)")
+
+gg.fc.scatter
+
+ggsave(paste0(dir.out, "/scatter_fc_trt.png"), width = 12, height = 4, units = "in")
+ggsave(paste0(dir.out, "/scatter_fc_trt.svg"), width = 12, height = 4, units = "in")
+ggsave(paste0(dir.out, "/scatter_fc_trt.pdf"), width = 12, height = 4, units = "in")
+```
+
+Interactive plot
+
+```{r}
+html.fc.scatter <- plotly::ggplotly(gg.fc.scatter)
+
+htmlwidgets::saveWidget(html.fc.scatter, 
+                        file = "scatter_fc_interactive.html", 
+                        selfcontained = TRUE, 
+                        title = "Fold changes by omic: old versus young")
+file.rename("scatter_fc_interactive.html", paste0(dir.out, "/scatter_fc_interactive.html"))
+```
+
+Linear correlation (Pearson's) between old and young fold changes upon bleo treatment
+
+```{r}
+out.cortest <- capture.output({
+  by(
+  df.fc.scatter, 
+   df.fc.scatter$se, 
+   function(x, ...) cor.test(x = x$Old_scoef.TRT, y = x$Young_scoef.TRT, ...), 
+   method = "pearson")
+})
+
+writeLines(out.cortest, paste0(dir.out, "/corrpearson_de_trt.txt"))
+writeLines(out.cortest)
+```
+
+## Violin plots
+
+Violin plot of log fold changes:
+
+```{r, fig.width=5}
+ggplot(df.fc.trt, aes(x = se, y = scoef.TRT, fill = Age)) +
+  geom_hline(yintercept = 0, colour = "gray60") +
+  geom_violin() + 
+  scale_fill_manual(values = config$col.age) +
+  theme(aspect.ratio = 1) +
+  xlab("Omic") +
+  ylab("Log2 fold change") +
+  gg_45()
+
+ggsave(filename = paste0(dir.out, "/violin_allmarkers.png"))
+ggsave(filename = paste0(dir.out, "/violin_allmarkers.pdf"))
+ggsave(filename = paste0(dir.out, "/violin_allmarkers.svg"))
+```
+
+```{r}
+mutate(df.fc.trt, 
+       signifname = ifelse(signif, "Significant", "Not significant")) %>%
+  ggplot(aes(x = se, y = scoef.TRT, fill = Age)) +
+  geom_hline(yintercept = 0, colour = "gray60") +
+  geom_violin() + 
+  scale_fill_manual(values = config$col.age) +
+  facet_wrap(~signifname) +
+  theme(aspect.ratio = 1) +
+  xlab("Omic") +
+  ylab("Log2 fold change") +
+  gg_45() 
+
+ggsave(filename = paste0(dir.out, "/violin_bysignificance.png"))
+ggsave(filename = paste0(dir.out, "/violin_bysignificance.pdf"))
+ggsave(filename = paste0(dir.out, "/violin_bysignificance.svg"))
+```
+
+## Barplots
+
+```{r}
+mutate(df.fc.trt, 
+       signifname = ifelse(signif, "Significant", "Not significant")) %>%
+  # group_by(se) %>%
+  # summarise(total = length(signif), signif = )
+  ggplot(aes(x = Age, alpha = signif, fill = Age)) +
+  geom_bar(position = "stack", colour = "gray30") + 
+  scale_alpha_discrete(name = "Significant") +
+  scale_fill_manual(values = config$col.age) +
+  # scale_fill_brewer(palette = "Set1", name = "Significant") +
+  facet_wrap(~se, scales = "free_y") +
+  # facet_grid(se~.) +
+  # coord_flip() +
+  theme(aspect.ratio = 1) +
+  xlab("Omic") +
+  ylab("Count") +
+  gg_45()
+
+ggsave(filename = paste0(dir.out, "/barplot_de_facet.svg"))
+ggsave(filename = paste0(dir.out, "/barplot_de_facet.pdf"))
+ggsave(filename = paste0(dir.out, "/barplot_de_facet.png"))
+```
+
+```{r}
+mutate(df.fc.trt, 
+      signifname = ifelse(signif, "Significant", "Not significant")) %>%
+  # group_by(se) %>%
+  # summarise(total = length(signif), signif = )
+  ggplot(aes(x = se, alpha = signif, fill = Age)) +
+  geom_bar(position = "dodge", colour = "gray30") + 
+  scale_alpha_discrete(name = "Significant") +
+  scale_fill_manual(values = config$col.age) +
+  # facet_wrap(~se, scales = "free_y") +
+  # facet_grid(se~.) +
+  # coord_flip() +
+  theme(aspect.ratio = 1) +
+  xlab("Omic") +
+  ylab("Count") +
+  gg_45() 
+
+ggsave(paste0(dir.out, "/barplot_de_nofacet.svg"))
+ggsave(paste0(dir.out, "/barplot_de_nofacet.pdf"))
+ggsave(paste0(dir.out, "/barplot_de_nofacet.png"))
+```
+
+## Venn diagrams
+
+```{r, fig.width=1.5, fig.height=1.5}
+df.fc.trt %>%
+  plyr::dlply("se", function(df) {
+    
+    dfs <- filter(df, signif)
+    se <- as.character(head(dfs$se, 1))
+    lst <- split(dfs$biomarker, dfs$Age)
+    
+    grid::grid.newpage()
+    biohelpeR::nicer_venn(prop.margin = .8)
+    vn <- VennDiagram::venn.diagram(
+        lst,
+        main = paste0("Differential ", se),
+        print.mode = "raw", 
+        main.cex = .65,
+        cex = .6,
+        lwd = .5,
+        ext.line.lwd = .5,
+        # height = 400,
+        # width = 400,
+        filename = NULL,
+        inverted = length(lst$Old) > length(lst$Young), 
+        category.names = c("", ""),
+        # rotation.degree = 180*(length(lst$Old) < length(lst$Young)), 
+        fill = config$col.age)
+    
+    grDevices::svg(paste0(dir.out, "/venn_de_", se, ".svg"), width = 1.5, height = 1.5)
+    grid::grid.draw(vn)
+    grDevices::dev.off()
+    
+    grDevices::pdf(paste0(dir.out, "/venn_de_", se, ".pdf"), 
+                   width = 2/2.54, height = 2/2.54, pointsize = 8.5)
+    grid::grid.draw(vn)
+    grDevices::dev.off()
+    
+    grDevices::png(paste0(dir.out, "/venn_de_", se, ".png"), width = 1.5, 
+                   height = 1.5, units = "in", res = 150)
+    grid::grid.draw(vn)
+    grDevices::dev.off()
+  
+    grid::grid.draw(vn)
+    
+    # browser()
+    # give significance / odds ratio
+    bkgd <- unique(df$biomarker)
+    tb <- table(
+      ifelse(bkgd %in% lst$Young, "SigYoung", "NonsigYoung"), 
+      ifelse(bkgd %in% lst$Old, "SigOld", "NonsigOld"))
+    
+    out.fisher <- capture.output({
+      print("Confusion table:")
+      
+      print(tb)
+      
+      fisher.test(
+        tb, 
+        alternative = "two.sided", 
+        conf.int = TRUE
+      )
+    })
+    writeLines(out.fisher, con = paste0(dir.out, "/oddsratio_de_", se, ".txt"))
+    
+    writeLines(out.fisher)
+  })
+```
+
+## Volcano plots
+
+
+```{r, fig.width=8, fig.height=6}
+fill.legend <- c(
+  setNames(config$col.age, paste0("Signif. in ", names(config$col.age))), 
+  setNames(c("gray40", "gray40"), paste0("N.s. in ", names(config$col.age)))
+)
+col.legend <- setNames(
+  c("black", "black", "white", "white"), 
+  names(fill.legend)
+)
+alpha.legend <- setNames(
+  c(1, 1, .1, .1), 
+  names(fill.legend)
+)
+
+mutate(df.fc.trt, 
+       Treatment = ifelse(signif, "Signif.", "N.s."), 
+       Legend = paste0(Treatment, " in ", Age)) %>%
+  ggplot(aes(x = scoef.TRT, y = -log10(spval.adj.TRT), 
+             fill = Legend, colour = Legend, alpha = Legend)) +
+  geom_hline(yintercept = 0, colour = "gray60") +
+  geom_vline(xintercept = 0, colour = "gray60") +
+  geom_point(cex = .85, pch = 21, stroke = .25) + 
+  scale_fill_manual(values = fill.legend) +
+  scale_colour_manual(values = col.legend) +
+  scale_alpha_manual(values = alpha.legend) +
+  facet_grid(Age~se) +
+  theme(aspect.ratio = 1, strip.text.y = element_text(angle = 0)) +
+  xlab("Log2 fold change") +
+  ylab("-log10(FDR)") 
+
+ggsave(filename = paste0(dir.out, "/volcano_general_facet.png"))
+ggsave(filename = paste0(dir.out, "/volcano_general_facet.pdf"))
+ggsave(filename = paste0(dir.out, "/volcano_general_facet.svg"))
+```
+
+```{r, fig.width=8, fig.height=6}
+# mutate(df.fc.trt, Treatment = ifelse(signif, "Significant", "Not significant")) %>%
+#   ggplot(aes(x = scoef.TRT, y = -log10(spval.adj.TRT), colour = Treatment)) +
+#   geom_hline(yintercept = 0, colour = "gray60") +
+#   geom_vline(xintercept = 0, colour = "gray60") +
+#   geom_point(cex = .85, alpha = .6, pch = 16) + 
+#   scale_colour_manual(values = c("gray90", "gray10")) +
+#   facet_grid(Age~se) +
+#   theme(aspect.ratio = 1, strip.text.y = element_text(angle = 0)) +
+#   xlab("Log2 fold change") +
+#   ylab("-log10(FDR)") +
+#   gg_45()
+# 
+# ggsave(filename = paste0(dir.out, "/volcano_general_facet.png"))
+# ggsave(filename = paste0(dir.out, "/volcano_general_facet.pdf"))
+# ggsave(filename = paste0(dir.out, "/volcano_general_facet.svg"))
+```
+
+
+# Comparison to Kang et al
+
+Join our table with that of Kang et al
+Add sub_pathway annotations
+
+```{r}
+df.fc.join <- dplyr::rename(df.fc.trt, BIOCHEMICAL = biomarker, logFC = scoef.TRT) %>% 
+  subset(Age == "Young" & se == "Metabolites") %>%
+  plyr::join(df.annot.kang.mapped, by = "BIOCHEMICAL", type = "left") %>%
+  plyr::join(as.data.frame(rowData(se.met))[c("BIOCHEMICAL", "SUPER_PATHWAY", "SUB_PATHWAY")], by = "BIOCHEMICAL", type = "left") %>%
+  mutate(
+    Direction = ifelse(logFC > 0, "UP", "DOWN"),
+    SignificantKangFull = ifelse(SignifKang, "Significant in Kang", "Non-significant in Kang"), 
+    SignificantKang = ifelse(SignifKang, "Significant", "Non-significant"), 
+    Significant = ifelse(signif, "Significant", "Non-significant")) %>%
+  mutate(`Kang et al` = ifelse(is.na(SignifKang), "N.meas.", ifelse(!SignifKang, "N.s.", stringr::str_to_title(DirectionKang))), 
+         `Our study` = ifelse(is.na(signif), "N.meas.", ifelse(!signif, "N.s.", stringr::str_to_title(Direction))))
+```
+
+Check labels Kang
+
+```{r}
+table(df.fc.join$`Kang et al`, df.fc.join$DirectionKang, exclude = NULL)
+```
+
+Check our labels
+
+```{r}
+table(df.fc.join$`Our study`, df.fc.join$Direction, exclude = NULL)
+```
+
+### Comparing significance
+
+```{r}
+subset(df.fc.join, !is.na(SignifKang)) %>%
+  ggplot(aes(x = Significant, y = logFC)) +
+  geom_hline(yintercept = 0, lty = 2) +
+  geom_boxplot() +
+  facet_wrap(~SignificantKangFull)
+
+ggsave(paste0(dir.out, "/01_boxplot_logfc_kang.pdf"))
+```
+
+### Comparing fold changes
+
+Number of data points (one per metabolite):
+
+```{r}
+subset(df.fc.join, !is.na(SignifKang)) %>% nrow
+```
+
+```{r, fig.height=6, fig.width=6}
+subset(df.fc.join, !is.na(SignifKang)) %>%
+  ggplot(aes(x = logFC, y = logFCKang)) +
+  geom_hline(yintercept = 0, lty = 2) +
+  geom_vline(xintercept = 0, lty = 2) +
+  geom_point(size = .5) +
+  ggrepel::geom_text_repel(aes(label = BIOCHEMICAL), size = 2.25, force = 1.5) +
+  facet_grid(Significant~SignificantKangFull) +
+  theme(aspect.ratio = 1)
+
+ggsave(paste0(dir.out, "/02_scatterplot_logfc_withnames_kang.pdf"))
+```
+
+
+# Heatmaps metabolites
+
+```{r}
+df.fc.signif <- subset(df.fc.trt, signif)
+
+se.met.signif <- mae[["Metabolites"]] %>%
+  extract(rownames(.) %in% df.fc.signif$biomarker)
+se.met.signif$Treatment <- ifelse(se.met.signif$TRT == "Bleo", "Bleo", "NaCl")
+se.met.signif$Age <- ifelse(se.met.signif$AGE == "21M", "Old", "Young")
+
+se.lip.signif <- mae[["Lipids"]] %>%
+  extract(rownames(.) %in% df.fc.signif$biomarker)
+se.lip.signif$Treatment <- ifelse(se.lip.signif$TRT == "Bleo", "Bleo", "NaCl")
+se.lip.signif$Age <- ifelse(se.lip.signif$AGE == "21M", "Old", "Young")
+```
+
+```{r}
+hm.color <- colorRampPalette(c("white", "indianred1"))(21)
+hm.color2 <- colorRampPalette(c("cornflowerblue", "white", "indianred1"))(21)
+hm.breaks <- seq(from = -2, to = 2, length.out = 22)
+
+sumexp_to_pheatmap <- function(se, vars.rows = NA, vars.cols = NA, ...) {
+  mat <- assay(se)
+  if (is.na(vars.rows)) df.rows <- NA
+  else df.rows <- rowData(se)[vars.rows] %>% as.data.frame
+  if (is.na(vars.cols)) df.cols <- NA
+  else df.cols <- colData(se)[vars.cols] %>% as.data.frame
+  
+  pheatmap(mat = mat, annotation_col = df.cols, annotation_row = df.rows, ...)
+}
+```
+
+
+## All
+
+
+Heatmap:
+
+```{r, fig.width=7, fig.height=7}
+gg.met.all <- sumexp_to_pheatmap(
+  se = se.met,  
+  scale = "row", 
+  vars.cols = c("Treatment", "Age"), 
+  annotation_colors = list(Treatment = config$col.trt, Age = config$col.age), 
+  show_rownames = FALSE, color = hm.color2)
+
+ggsave(gg.met.all, filename = paste0(dir.out, "/heatmap_metab_all_clust.png"))
+ggsave(gg.met.all, filename = paste0(dir.out, "/heatmap_metab_all_clust.svg"))
+ggsave(gg.met.all, filename = paste0(dir.out, "/heatmap_metab_all_clust.pdf"))
+```
+
+## Significant
+
+Clustering mice
+
+```{r, fig.width=9, fig.height=7}
+rows.met <- rownames(se.met) %in% df.fc.signif$biomarker
+gg.met.sig <- sumexp_to_pheatmap(
+  se = se.met[rows.met, ], 
+  scale = "row", 
+  vars.cols = c("Treatment", "Age"), 
+  vars.rows = "SUPER_PATHWAY",
+  annotation_colors = list(Treatment = config$col.trt, Age = config$col.age), 
+  show_rownames = FALSE, color = hm.color2)
+
+ggsave(gg.met.sig, filename = paste0(dir.out, "/heatmap_metab_signif_clust.png"))
+ggsave(gg.met.sig, filename = paste0(dir.out, "/heatmap_metab_signif_clust.svg"))
+ggsave(gg.met.sig, filename = paste0(dir.out, "/heatmap_metab_signif_clust.pdf"))
+```
+Not clustering mice
+
+```{r, fig.width=7, fig.height=7}
+gg.met.sig.noclust <- sumexp_to_pheatmap(
+  se = se.met[rows.met, ], 
+  scale = "row", 
+  vars.cols = c("Treatment", "Age"), 
+  vars.rows = "SUPER_PATHWAY",
+  annotation_colors = list(Treatment = config$col.trt, Age = config$col.age), 
+  show_rownames = FALSE, color = hm.color2, cluster_cols = FALSE)
+
+ggsave(gg.met.sig.noclust, filename = paste0(dir.out, "/heatmap_metab_signif_noclust.png"))
+ggsave(gg.met.sig.noclust, filename = paste0(dir.out, "/heatmap_metab_signif_noclust.svg"))
+ggsave(gg.met.sig.noclust, filename = paste0(dir.out, "/heatmap_metab_signif_noclust.pdf"))
+```
+
+## Literature
+
+
+
+Heatmap
+
+```{r}
+hm.color.lfc <- colorRampPalette(c("cornflowerblue", "white", "indianred1"))(21)
+hm.breaks.lfc <- seq(from = -3, to = 3, length.out = 22)
+
+annot.color <- list(
+  Treatment = config$col.trt, 
+  Age = config$col.age, 
+  Significant = c("Non-significant" = "white", "Significant" = "gray50"), 
+  SignificantKang = c("Non-significant" = "white", "Significant" = "gray50"), 
+  DirectionKang = c("DOWN" = "turquoise", "UP" = "orange", "UNCHANGED" = "white"), 
+  Direction = c("DOWN" = "turquoise", "UP" = "orange")
+  )
+
+col.dir <- c("N.meas." = "white", "N.s." = "gray85", "Up" = "orange", "Down" = "turquoise")
+annot.color2 <- list(
+  Treatment = config$col.trt, 
+  Age = config$col.age, 
+  `Kang et al` = col.dir, 
+  `Our study` = col.dir
+  )
+
+ids.p <- df.fc.join$BIOCHEMICAL %>% as.character
+mat.p <- assay(se.met)[ids.p, ]
+
+col.p <- colData(se.met)[, c("Age", "Treatment")] %>% as.data.frame
+row.p <- df.fc.join %>%
+  extract(c("Significant", "SignificantKang", "Direction", "DirectionKang", "BIOCHEMICAL")) %>% 
+  mutate_all(as.character) %>%
+  tibble::column_to_rownames("BIOCHEMICAL") 
+
+
+row.p2 <- df.fc.join %>%
+  extract(c("Kang et al", "Our study", "SUB_PATHWAY", "BIOCHEMICAL")) %>% 
+  mutate_all(as.character) %>%
+  tibble::column_to_rownames("BIOCHEMICAL") 
+  
+```
+
+Original legend (separating signif/direction)
+
+```{r, fig.height=7.5, fig.width=7.5}
+metab.kang <- subset(df.fc.join, !is.na(SignifKang))$BIOCHEMICAL %>% as.character
+
+p.sort <- pheatmap(
+  mat = mat.p[metab.kang, ], 
+  color = hm.color.lfc ,
+  breaks = hm.breaks.lfc ,
+  main = "Comparison with Kang et al.",
+  annotation_col = col.p,
+  annotation_row = row.p[metab.kang, ],
+  show_rownames = TRUE,
+  scale = "row",
+  show_colnames = FALSE,
+  cluster_cols = FALSE,
+  cluster_rows = TRUE,
+  border_color = "white",
+  annotation_colors = annot.color,
+  silent = FALSE
+) 
+
+# ggsave(plot = p.sort, filename = paste0(dir.out, "/heatmap_all_withnames_kang.pdf"))
+# ggsave(plot = p.sort, filename = paste0(dir.out, "/heatmap_all_withnames_kang.png"))
+# ggsave(plot = p.sort, filename = paste0(dir.out, "/heatmap_all_withnames_kang.svg"))
+```
+
+New legend combining direction and significance
+
+```{r, fig.height=7.5, fig.width=7.5}
+p.sort <- pheatmap(
+  mat = mat.p[metab.kang, ], 
+  color = hm.color.lfc ,
+  breaks = hm.breaks.lfc ,
+  main = "Comparison with Kang et al.",
+  annotation_col = col.p,
+  annotation_row = row.p2[metab.kang, c("Kang et al", "Our study")],
+  show_rownames = TRUE,
+  scale = "row",
+  show_colnames = FALSE,
+  cluster_cols = FALSE,
+  cluster_rows = TRUE,
+  border_color = "white",
+  annotation_colors = annot.color2,
+  silent = FALSE
+) 
+
+ggsave(plot = p.sort, filename = paste0(dir.out, "/heatmap_all_withnames_kang.pdf"))
+ggsave(plot = p.sort, filename = paste0(dir.out, "/heatmap_all_withnames_kang.png"))
+ggsave(plot = p.sort, filename = paste0(dir.out, "/heatmap_all_withnames_kang.svg"))
+```
+
+
+Remove row clustering, add subpathway, and sort by logFC
+
+
+```{r, fig.height=7.5, fig.width=10}
+# arrangement by logFC
+df.fc.join.decreasingLogFC <- arrange(df.fc.join, -logFC)
+metab.decreasingLogFC <- intersect(df.fc.join.decreasingLogFC$BIOCHEMICAL, metab.kang)
+
+subset(df.fc.join.decreasingLogFC, BIOCHEMICAL %in% metab.kang)
+```
+
+```{r, fig.height=7.5, fig.width=10}
+p.sortlogfc.pathway <- pheatmap(
+  mat = mat.p[metab.decreasingLogFC, ], 
+  color = hm.color.lfc ,
+  breaks = hm.breaks.lfc ,
+  main = "Comparison with Kang et al.",
+  annotation_col = col.p,
+  annotation_row = row.p2[metab.decreasingLogFC, c("Kang et al", "Our study", "SUB_PATHWAY")],
+  show_rownames = TRUE,
+  scale = "row",
+  show_colnames = FALSE,
+  cluster_cols = FALSE,
+  cluster_rows = FALSE,
+  border_color = "white",
+  annotation_colors = annot.color2,
+  silent = FALSE
+) 
+
+ggsave(plot = p.sortlogfc.pathway, filename = paste0(dir.out, "/heatmap_all_withnames_kang_nocluster_subpathways_sortlogfc.pdf"))
+ggsave(plot = p.sortlogfc.pathway, filename = paste0(dir.out, "/heatmap_all_withnames_kang_nocluster_subpathways_sortlogfc.png"))
+ggsave(plot = p.sortlogfc.pathway, filename = paste0(dir.out, "/heatmap_all_withnames_kang_nocluster_subpathways_sortlogfc.svg"))
+```
+
+
+
+Size of heatmap:
+
+```{r}
+dim(mat.p[metab.kang, ])
+```
+
+
+## Custom pathways
+
+### Pathway 1: proteins
+
+```{r}
+
+list.custommaps.df$Proteins
+
+```
+
+```{r, fig.width=9, fig.height=5}
+n <- 1
+nm <- "Proteins"
+id.nm <- list.custommaps.met[[nm]]
+ph.prot <- pheatmap(
+  mat = mat.p[id.nm, ], 
+  color = hm.color.lfc ,
+  breaks = hm.breaks.lfc ,
+  main = nm,
+  annotation_col = col.p,
+  annotation_row = row.p2[id.nm, ],
+  show_rownames = TRUE,
+  scale = "row",
+  show_colnames = FALSE,
+  cluster_cols = FALSE,
+  cluster_rows = FALSE,
+  border_color = "white",
+  annotation_colors = annot.color2,
+  silent = FALSE
+) 
+
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".png"), ph.prot)
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".svg"), ph.prot)
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".pdf"), ph.prot)
+```
+
+### Pathway 2: nucleotides
+
+```{r, fig.width=9, fig.height=5}
+n <- 2
+nm <- "Nucleotides"
+id.nm <- list.custommaps.met[[nm]]
+ph.prot <- pheatmap(
+  mat = mat.p[id.nm, ], 
+  color = hm.color.lfc ,
+  breaks = hm.breaks.lfc ,
+  main = nm,
+  annotation_col = col.p,
+  annotation_row = row.p2[id.nm, ],
+  show_rownames = TRUE,
+  scale = "row",
+  show_colnames = FALSE,
+  cluster_cols = FALSE,
+  cluster_rows = FALSE,
+  border_color = "white",
+  annotation_colors = annot.color2,
+  silent = FALSE
+) 
+
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".png"), ph.prot)
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".svg"), ph.prot)
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".pdf"), ph.prot)
+```
+
+### Pathway 3: Lipid turnover
+
+```{r, fig.width=9, fig.height=6.5}
+n <- 3
+nm <- "Lipid turnover"
+id.nm <- list.custommaps.met[[nm]]
+ph.prot <- pheatmap(
+  mat = mat.p[id.nm, ], 
+  color = hm.color.lfc ,
+  breaks = hm.breaks.lfc ,
+  main = nm,
+  annotation_col = col.p,
+  annotation_row = row.p2[id.nm, ],
+  show_rownames = TRUE,
+  scale = "row",
+  show_colnames = FALSE,
+  cluster_cols = FALSE,
+  cluster_rows = FALSE,
+  border_color = "white",
+  annotation_colors = annot.color2,
+  silent = FALSE
+) 
+
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".png"), ph.prot)
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".svg"), ph.prot)
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".pdf"), ph.prot)
+```
+
+### Pathway 4: Lipids merged
+
+```{r, fig.width=10, fig.height=8.5}
+n <- 4
+nm <- "Lipids merged"
+id.nm <- list.custommaps.met[[nm]]
+ph.prot <- pheatmap(
+  mat = mat.p[id.nm, ], 
+  color = hm.color.lfc ,
+  breaks = hm.breaks.lfc ,
+  main = nm,
+  annotation_col = col.p,
+  annotation_row = row.p2[id.nm, ],
+  show_rownames = TRUE,
+  scale = "row",
+  show_colnames = FALSE,
+  cluster_cols = FALSE,
+  cluster_rows = FALSE,
+  border_color = "white",
+  annotation_colors = annot.color2,
+  silent = FALSE
+) 
+ph.prot
+
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".png"), ph.prot)
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".svg"), ph.prot)
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".pdf"), ph.prot)
+```
+
+### Pathway 5: FAO
+
+```{r, fig.width=10, fig.height=5}
+n <- 5
+nm <- "FAO"
+id.nm <- list.custommaps.met[[nm]]
+ph.prot <- pheatmap(
+  mat = mat.p[id.nm, ], 
+  color = hm.color.lfc ,
+  breaks = hm.breaks.lfc ,
+  main = nm,
+  annotation_col = col.p,
+  annotation_row = row.p2[id.nm, ],
+  show_rownames = TRUE,
+  scale = "row",
+  show_colnames = FALSE,
+  cluster_cols = FALSE,
+  cluster_rows = FALSE,
+  border_color = "white",
+  annotation_colors = annot.color2,
+  silent = FALSE
+) 
+
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".png"), ph.prot)
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".svg"), ph.prot)
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".pdf"), ph.prot)
+```
+
+### Pathway 6: Collagen turnover
+
+```{r, fig.width=9, fig.height=5}
+n <- 6
+nm <- "Collagen turnover"
+id.nm <- list.custommaps.met[[nm]]
+ph.prot <- pheatmap(
+  mat = mat.p[id.nm, ], 
+  color = hm.color.lfc ,
+  breaks = hm.breaks.lfc ,
+  main = nm,
+  annotation_col = col.p,
+  annotation_row = row.p2[id.nm, ],
+  show_rownames = TRUE,
+  scale = "row",
+  show_colnames = FALSE,
+  cluster_cols = FALSE,
+  cluster_rows = FALSE,
+  border_color = "white",
+  annotation_colors = annot.color2,
+  silent = FALSE
+) 
+
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".png"), ph.prot)
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".svg"), ph.prot)
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".pdf"), ph.prot)
+```
+
+### Pathway 7: glycolysis PPP
+
+```{r, fig.width=10, fig.height=5.5}
+n <- 7
+nm <- "glycolysis PPP"
+id.nm <- list.custommaps.met[[nm]]
+ph.prot <- pheatmap(
+  mat = mat.p[id.nm, ], 
+  color = hm.color.lfc ,
+  breaks = hm.breaks.lfc ,
+  main = nm,
+  annotation_col = col.p,
+  annotation_row = row.p2[id.nm, ],
+  show_rownames = TRUE,
+  scale = "row",
+  show_colnames = FALSE,
+  cluster_cols = FALSE,
+  cluster_rows = FALSE,
+  border_color = "white",
+  annotation_colors = annot.color2,
+  silent = FALSE
+) 
+
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".png"), ph.prot)
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".svg"), ph.prot)
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".pdf"), ph.prot)
+```
+
+### Pathway 8: Eicosanoids
+
+```{r, fig.width=9, fig.height=4}
+n <- 8
+nm <- "Eicosanoids"
+id.nm <- list.custommaps.met[[nm]]
+ph.prot <- pheatmap(
+  mat = mat.p[id.nm, ], 
+  color = hm.color.lfc ,
+  breaks = hm.breaks.lfc ,
+  main = nm,
+  annotation_col = col.p,
+  annotation_row = row.p2[id.nm, ],
+  show_rownames = TRUE,
+  scale = "row",
+  show_colnames = FALSE,
+  cluster_cols = FALSE,
+  cluster_rows = FALSE,
+  border_color = "white",
+  annotation_colors = annot.color2,
+  silent = FALSE
+) 
+
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".png"), ph.prot)
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".svg"), ph.prot)
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".pdf"), ph.prot)
+```
+
+
+# Heatmaps lipids
+
+
+```{r}
+# row annotations for heatmap
+row.lip <- df.fc.scatter %>% 
+  subset(se == "Lipids") %>%
+  mutate(`Our study` = ifelse(label %in% c("Old", "n.s."), "N.s.", ifelse(Young_scoef.TRT > 0, "Up", "Down"))) %>%
+  set_rownames(.$biomarker) 
+
+table(row.lip$label, row.lip$`Our study`)
+```
+
+
+## All
+
+Number of non-constant features
+
+```{r}
+sum(lip.nonctt)
+```
+
+Heatmap of those:
+
+```{r, fig.width=7, fig.height=7}
+gg.lip.all <- sumexp_to_pheatmap(
+  se = se.lip[lip.nonctt, ], 
+  scale = "row", 
+  vars.cols = c("Treatment", "Age"), 
+  annotation_colors = list(Treatment = config$col.trt, Age = config$col.age), 
+  show_rownames = FALSE, color = hm.color2)
+
+
+ggsave(gg.lip.all, filename = paste0(dir.out, "/heatmap_lip_all_clust.png"))
+ggsave(gg.lip.all, filename = paste0(dir.out, "/heatmap_lip_all_clust.svg"))
+ggsave(gg.lip.all, filename = paste0(dir.out, "/heatmap_lip_all_clust.pdf"))
+```
+
+## Significant
+
+Reordering
+
+```{r, fig.width=7, fig.height=7}
+rows.lip <- rownames(se.lip) %in% df.fc.signif$biomarker
+gg.lip.signif <- sumexp_to_pheatmap(
+  se = se.lip[rows.lip, ], 
+  scale = "row", 
+  vars.cols = c("Treatment", "Age"), 
+  annotation_colors = list(Treatment = config$col.trt, Age = config$col.age), 
+  show_rownames = FALSE, color = hm.color2)
+
+
+
+ggsave(gg.lip.signif, filename = paste0(dir.out, "/heatmap_lip_signif_clust.png"))
+ggsave(gg.lip.signif, filename = paste0(dir.out, "/heatmap_lip_signif_clust.svg"))
+ggsave(gg.lip.signif, filename = paste0(dir.out, "/heatmap_lip_signif_clust.pdf"))
+```
+
+No reordering
+
+```{r, fig.width=7, fig.height=7}
+gg.lip.signif.noclust <- sumexp_to_pheatmap(
+  se = se.lip[rows.lip, ], 
+  scale = "row", 
+  vars.cols = c("Treatment", "Age"), 
+  vars.rows = "SUPER_PATHWAY",
+  annotation_colors = list(Treatment = config$col.trt, Age = config$col.age), 
+  show_rownames = FALSE, color = hm.color2, cluster_cols = FALSE)
+
+
+
+ggsave(gg.lip.signif.noclust, filename = paste0(dir.out, "/heatmap_lip_signif_noclust.png"))
+ggsave(gg.lip.signif.noclust, filename = paste0(dir.out, "/heatmap_lip_signif_noclust.svg"))
+ggsave(gg.lip.signif.noclust, filename = paste0(dir.out, "/heatmap_lip_signif_noclust.pdf"))
+```
+
+## Custom pathways
+
+### Total lipids
+
+Heatmap:
+
+```{r, fig.width=5, fig.height=3.5}
+n <- 9
+nm <- "Total lipids"
+id.nm <- list.custommaps.lip[[nm]]
+
+# now added significance labels
+ph.lip <- pheatmap(
+  mat = assay(se.lip)[id.nm, ], 
+  color = hm.color.lfc ,
+  breaks = hm.breaks.lfc ,
+  main = nm,
+  annotation_col = as.data.frame(colData(se.lip))[c("Age", "Treatment")],
+  annotation_row = row.lip[id.nm, "Our study", drop = FALSE],
+  show_rownames = TRUE,
+  scale = "row",
+  show_colnames = FALSE,
+  cluster_cols = FALSE,
+  cluster_rows = FALSE,
+  border_color = "white",
+  annotation_colors = annot.color2,
+  silent = FALSE
+) 
+
+# ph.lip <- sumexp_to_pheatmap(
+#   se = se.lip[rows.lipall, ],  
+#   scale = "row", 
+#   vars.cols = c("Treatment", "Age"), 
+#   annotation_colors = list(Treatment = config$col.trt, Age = config$col.age), 
+#   show_rownames = TRUE, show_colnames = FALSE, cluster_cols = FALSE, cluster_rows = FALSE,
+#   color = hm.color2, main = nm)
+
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".png"), ph.lip)
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".svg"), ph.lip)
+ggsave(paste0(dir.out, "/heatmap_custommaps_", n, "_", nm, ".pdf"), ph.lip)
+```
+
+# Boxplots metabolites
+
+## Jelena's list
+
+```{r}
+lines.metabs <- readLines("00_dataraw/literature/ListMetabolites.txt")
+list.metabs <- split(lines.metabs, cumsum(lines.metabs == "") + 1) %>% lapply(setdiff, "")
+names(list.metabs) <- paste0("Group", names(list.metabs))
+
+list.metabs
+```
+Check their mapping to the original data, are we missing anything?
+
+```{r}
+lapply(list.metabs, setdiff, rownames(se.met))
+```
+
+
+
+Melt data for boxplot
+
+```{r}
+
+se.met.scaled <- se.met
+assay(se.met.scaled) %<>% 
+  t %>%
+  scale(center = TRUE, scale = TRUE) %>%
+  t
+
+# check scaling
+# 0-mean?
+assay(se.met.scaled) %>% 
+  rowSums %>% abs %>% max %>% 
+  magrittr::is_less_than(1e-10) %>% stopifnot
+
+# sd = 1?
+assay(se.met.scaled) %>% 
+  apply(1, sd) %>%
+  magrittr::subtract(1) %>%
+  abs %>% max %>% 
+  magrittr::is_less_than(1e-10) %>% stopifnot
+
+
+df.long.met <- colData(se.met) %>%
+  as.data.frame %>%
+  tibble::rownames_to_column("colname") %>%
+  dplyr::inner_join(MultiAssayExperiment::longFormat(se.met.scaled))
+
+
+```
+
+```{r, fig.height=8}
+# # rstatix to add p-values
+# # https://www.datanovia.com/en/blog/how-to-add-p-values-onto-a-grouped-ggplot-using-the-ggpubr-r-package/
+# # this runs, but not used at the moment
+# stat.test <- df.long.met %>%
+#   group_by(Age, rowname) %>%
+#   t_test(value ~ Group) %>%
+#   adjust_pvalue(method = "BH") %>%
+#   add_significance("p.adj") 
+
+# ggboxplot(
+#   subset(df.long.met, rowname %in% list.metabs$Group1), 
+#   x = "Group", y = "value", facet.by = "rowname", fill = "Group"
+# ) +
+#   geom_jitter(width = .25, pch = 21) +
+#   scale_fill_manual(values = config$col.agetrt) +
+#   stat_pvalue_manual(subset(stat.test, rowname %in% list.metabs$Group0) %>% select(-Age), y.position = 30, label = "p.adj") +
+#   facet_wrap(~rowname, scales = "free_y", 
+#              labeller = label_wrap_gen(width = 25)) +
+#   theme(aspect.ratio = 1) +
+#   xlab("") +
+#   ylab("Abundance") +
+#   gg_45()
+
+```
+
+
+```{r}
+# # takes forever
+# stat.test2 <- stat.test %>% select(-Age) %>% add_xy_position(x = "Group", dodge = 0.8)
+
+# # mutate(group1 = paste0(Age, " NaCl"), group2 = paste0(Age, " Bleo"), `.y.` = "value") %>%
+#   dplyr::select(group1, group2, p.adj, `.y.`) 
+# %>%
+#   add_xy_position(x = "group1", dodge = 0.8)
+# # bxp + stat_pvalue_manual(
+# #   stat.test,  label = "p", tip.length = 0
+# #   )
+
+```
+
+
+```{r}
+y.lab <- "Abundance (z-score)"
+```
+
+
+### Grp1
+
+Draw boxplots
+
+```{r, fig.width=9, fig.height=7}
+subset(df.long.met, rowname %in% list.metabs$Group1) %>%
+  ggplot(aes(x = Group, y = value, fill = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = .25, pch = 21) +
+  scale_y_continuous(expand = expansion(mult = c(.05, 0.25))) +
+  scale_fill_manual(values = config$col.agetrt) +
+  facet_wrap(~rowname, scales = "free_y", nrow = 3, 
+             labeller = label_wrap_gen(width = 25)) +
+  xlab("") +
+  ylab(y.lab) +
+  theme(aspect.ratio = 1, axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(), 
+        axis.title.x = element_blank(), legend.position = "bottom") 
+  # stat_compare_means(label = "p.format",
+  #                    method = "wilcox.test",
+  #                    hide.ns = TRUE,
+  #                    tip.length = 0,
+  #                    size = 2,
+  #                    comparisons = list(c(1,2), c(3,4)),
+  #                    method.args = list(var.equal = TRUE, alternative = "two.sided")) +
+  # coord_fixed() +
+  # stat_pvalue_manual(stat.test, y.position = 30, label = "p.adj") +
+  # gg_45()
+
+
+ggsave(paste0(dir.out, "/boxplots_metab_grp1.png"))
+ggsave(paste0(dir.out, "/boxplots_metab_grp1.pdf"))
+ggsave(paste0(dir.out, "/boxplots_metab_grp1.svg"))
+```
+
+### Grp2
+
+```{r, fig.width=9, fig.height=7}
+subset(df.long.met, rowname %in% list.metabs$Group2) %>%
+  ggplot(aes(x = Group, y = value, fill = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = .25, pch = 21) +
+  scale_y_continuous(expand = expansion(mult = c(.05, 0.25))) +
+  scale_fill_manual(values = config$col.agetrt) +
+  facet_wrap(~rowname, scales = "free_y", nrow = 3,
+             labeller = label_wrap_gen(width = 20)) +
+  xlab("") +
+  ylab(y.lab) +
+  theme(aspect.ratio = 1, axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(), 
+        axis.title.x = element_blank(), legend.position = "bottom") 
+
+
+ggsave(paste0(dir.out, "/boxplots_metab_grp2.png"))
+ggsave(paste0(dir.out, "/boxplots_metab_grp2.pdf"))
+ggsave(paste0(dir.out, "/boxplots_metab_grp2.svg"))
+```
+
+### Grp3
+
+```{r, fig.width=6, fig.height=7}
+subset(df.long.met, rowname %in% list.metabs$Group3) %>%
+  ggplot(aes(x = Group, y = value, fill = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = .25, pch = 21) +
+  scale_y_continuous(expand = expansion(mult = c(.05, 0.25))) +
+  scale_fill_manual(values = config$col.agetrt) +
+  facet_wrap(~rowname, scales = "free_y", 
+             labeller = label_wrap_gen(width = 25)) +
+  xlab("") +
+  ylab(y.lab) +
+  theme(aspect.ratio = 1, axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(), 
+        axis.title.x = element_blank(), legend.position = "bottom") 
+
+ggsave(paste0(dir.out, "/boxplots_metab_grp3.png"))
+ggsave(paste0(dir.out, "/boxplots_metab_grp3.pdf"))
+ggsave(paste0(dir.out, "/boxplots_metab_grp3.svg"))
+```
+
+### Grp4
+
+```{r, fig.width=9, fig.height=3}
+subset(df.long.met, rowname %in% list.metabs$Group4) %>%
+  ggplot(aes(x = Group, y = value, fill = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = .25, pch = 21) +
+  scale_y_continuous(expand = expansion(mult = c(.05, 0.25))) +
+  scale_fill_manual(values = config$col.agetrt) +
+  facet_wrap(~rowname, scales = "free_y", nrow = 1,
+             labeller = label_wrap_gen(width = 20)) +
+  xlab("") +
+  ylab(y.lab) +
+  theme(aspect.ratio = 1, axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(), 
+        axis.title.x = element_blank(), legend.position = "bottom") 
+
+
+ggsave(paste0(dir.out, "/boxplots_metab_grp4.png"))
+ggsave(paste0(dir.out, "/boxplots_metab_grp4.pdf"))
+ggsave(paste0(dir.out, "/boxplots_metab_grp4.svg"))
+```
+
+
+### Grp5
+
+```{r, fig.width=7, fig.height=3}
+subset(df.long.met, rowname %in% list.metabs$Group5) %>%
+  ggplot(aes(x = Group, y = value, fill = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = .25, pch = 21) +
+  scale_y_continuous(expand = expansion(mult = c(.05, 0.25))) +
+  scale_fill_manual(values = config$col.agetrt) +
+  facet_wrap(~rowname, scales = "free_y", nrow = 1,
+             labeller = label_wrap_gen(width = 20)) +
+  xlab("") +
+  ylab(y.lab) +
+  theme(aspect.ratio = 1, axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(), 
+        axis.title.x = element_blank(), legend.position = "bottom") 
+
+
+ggsave(paste0(dir.out, "/boxplots_metab_grp5.png"))
+ggsave(paste0(dir.out, "/boxplots_metab_grp5.pdf"))
+ggsave(paste0(dir.out, "/boxplots_metab_grp5.svg"))
+```
+
+# Reproducibility
+
+```{r}
+date()
+```
+
+```{r}
+sessionInfo()
+```
+
+
+

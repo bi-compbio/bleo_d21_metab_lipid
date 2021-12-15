@@ -1,0 +1,313 @@
+---
+title: "Stratified differential abundance, old versus young - metabolomics and lipidomics"
+author: "Sergio Picart-Armada"
+date: "9th April, 2021"
+output:
+  html_document:
+    toc: TRUE
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, 
+                      error = FALSE, warning = FALSE, 
+                      fig.height = 4)
+```
+
+# Loading the data
+
+```{r cars}
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(magrittr)
+
+library(SummarizedExperiment)
+library(MultiAssayExperiment)
+
+library(ggplot2)
+library(ggpmisc)
+library(ggpubr)
+library(rstatix)
+library(plotly)
+# library(GGally)
+# library(corrplot)
+library(psych)
+
+# library(pls)
+# library(pcaMethods)
+# library(emmeans)
+
+library(data.table)
+# library(UpSetR)
+
+library(clusterProfiler)
+
+# metabolomics
+library(FELLA)
+library(igraph)
+
+library(pheatmap)
+
+config <- new.env()
+source("config.R", local = config)
+source("helpers.R")
+
+# load all the omics data
+mae <- readRDS(config$out.mae)
+
+theme_set(theme_bw())
+
+futile.logger::flog.threshold(futile.logger::ERROR, name = "VennDiagramLogger")
+
+dir.out <- config$dir.diffplotsage
+if (!dir.exists(dir.out)) dir.create(dir.out)
+
+set.seed(1)
+```
+
+
+```{r}
+fc.ref <- config$fc.ref
+q.ref <- config$q.ref
+```
+
+## Sanity checks
+
+```{r}
+plyr::l_ply(experiments(mae), 
+       function(se) stopifnot(levels(colData(se)$TRT)[2] == "Bleo")
+)
+plyr::l_ply(experiments(mae), 
+       function(se) stopifnot(levels(colData(se)$AGE)[2] == "21M")
+)
+
+lapply(experiments(mae), 
+       function(se) levels(colData(se)$TRT))
+lapply(experiments(mae), 
+       function(se) levels(colData(se)$AGE))
+
+# check sample mapping concistency
+# if this breaks down, check sampleMap(mae)
+mae[, colData(mae)$AnimalID]
+```
+
+Use chemical names for better readability
+
+
+```{r}
+
+rownames(experiments(mae)$Lipids) <- rowData(experiments(mae)$Lipids)$BIOCHEMICAL
+rownames(experiments(mae)$Metabolites) <- rowData(experiments(mae)$Metabolites)$BIOCHEMICAL
+
+```
+
+
+Load fold changes
+
+```{r}
+df.fc.age <- read.csv(config$df.fc.age) %>%
+  mutate(Treatment = factor(Treatment, levels = names(config$col.trt)), 
+         se = factor(se, levels = names(config$col.omic)))
+```
+
+
+
+
+# Descriptive statistics
+
+
+
+# Differential Plots
+
+## Scatterplots
+
+```{r, fig.width=7, fig.height=4}
+# # myspread spreads multiple columns 
+# v.oldyoung.labels <- c("00" = "None", "10" = "Old", "01" = "Young", "11" = "Both")
+# v.oldyoung.colors <- setNames(
+#   c("gray85", config$col.age["Old"], config$col.age["Young"], "#C09393"), 
+#   v.oldyoung.labels
+# )
+
+df.fc.scatter <- dplyr::select(df.fc.age, Treatment, se, biomarker, scoef.AGE, signif) %>%
+  myspread(Treatment, c(scoef.AGE, signif)) %>% 
+  tidyr::unite(bleonaclsignif, Bleo_signif, NaCl_signif, sep = "") %>%
+  mutate(label = factor(config$v.bleonacl.labels[bleonaclsignif], levels = config$v.bleonacl.labels)) %>%
+  arrange(bleonaclsignif) ##%>%
+  #left_join(env.export$df.map)
+  
+gg.fc.scatter <- ggplot(df.fc.scatter, aes(x = NaCl_scoef.AGE, y = Bleo_scoef.AGE)) +
+  geom_hline(yintercept = 0, colour = "gray70") + 
+  geom_vline(xintercept = 0, colour = "gray70") + 
+  geom_point(aes(colour = label, labelplotly = biomarker), cex = .85, alpha = .6, pch = 16) + 
+  geom_abline(intercept = 0, slope = 1, lty = 2, colour = "gray50", lwd = .25) +
+  geom_smooth(method = "lm", colour = "gray40", se = TRUE) + 
+  scale_colour_manual(values = config$v.bleonacl.colors, name = "Significant") +
+  stat_poly_eq(formula = y ~ x, 
+               mapping = aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+               parse = TRUE) +
+  facet_wrap(~se, nrow = 1) +
+  coord_fixed() + 
+  theme(aspect.ratio = 1) +
+  guides(colour = guide_legend(override.aes = list(size = 5))) +
+  xlab("Log2 age fold change (NaCl)") + 
+  ylab("Log2 age fold change (Bleo)")
+
+gg.fc.scatter
+
+ggsave(paste0(dir.out, "/scatter_fc_age.png"), width = 12, height = 4, units = "in")
+ggsave(paste0(dir.out, "/scatter_fc_age.svg"), width = 12, height = 4, units = "in")
+ggsave(paste0(dir.out, "/scatter_fc_age.pdf"), width = 12, height = 4, units = "in")
+```
+
+Interactive plot
+
+```{r}
+html.fc.scatter <- plotly::ggplotly(gg.fc.scatter)
+
+htmlwidgets::saveWidget(html.fc.scatter, 
+                        file = "scatter_fc_interactive.html", 
+                        selfcontained = TRUE, 
+                        title = "Fold changes by omic: old versus young")
+file.rename("scatter_fc_interactive.html", paste0(dir.out, "/scatter_fc_interactive.html"))
+```
+
+Pearson correlation of age fold changes between bleo and NaCl
+
+```{r}
+out.cortest <- capture.output({
+  by(
+  df.fc.scatter, 
+   df.fc.scatter$se, 
+   function(x, ...) cor.test(x = x$Bleo_scoef.AGE, y = x$NaCl_scoef.AGE, ...), 
+   method = "pearson")
+})
+
+writeLines(out.cortest, paste0(dir.out, "/corrpearson_de_age.txt"))
+writeLines(out.cortest)
+```
+
+
+
+## Violin plots
+
+Violin plot of log fold changes:
+
+```{r, fig.width=5}
+ggplot(df.fc.age, aes(x = se, y = scoef.AGE, fill = Treatment)) +
+  geom_hline(yintercept = 0, colour = "gray60") +
+  geom_violin() + 
+  scale_fill_manual(values = config$col.trt2) +
+  theme(aspect.ratio = 1) +
+  xlab("Omic") +
+  ylab("Log2 fold change (age)") +
+  gg_45()
+
+ggsave(filename = paste0(dir.out, "/violin_allmarkers.png"))
+ggsave(filename = paste0(dir.out, "/violin_allmarkers.pdf"))
+ggsave(filename = paste0(dir.out, "/violin_allmarkers.svg"))
+```
+
+## Barplots
+
+```{r}
+mutate(df.fc.age, 
+       signifname = ifelse(signif, "Significant", "Not significant")) %>%
+  # group_by(se) %>%
+  # summarise(total = length(signif), signif = )
+  ggplot(aes(x = Treatment, alpha = signif, fill = Treatment)) +
+  geom_bar(position = "stack", colour = "gray30") + 
+  scale_alpha_discrete(name = "Significant") +
+  scale_fill_manual(values = config$col.trt2) +
+  # scale_fill_brewer(palette = "Set1", name = "Significant") +
+  facet_wrap(~se, scales = "free_y") +
+  # facet_grid(se~.) +
+  # coord_flip() +
+  theme(aspect.ratio = 1) +
+  xlab("Omic") +
+  ylab("Count") +
+  gg_45()
+
+ggsave(filename = paste0(dir.out, "/barplot_de_facet.svg"))
+ggsave(filename = paste0(dir.out, "/barplot_de_facet.pdf"))
+ggsave(filename = paste0(dir.out, "/barplot_de_facet.png"))
+```
+
+```{r}
+mutate(df.fc.age, 
+      signifname = ifelse(signif, "Significant", "Not significant")) %>%
+  # group_by(se) %>%
+  # summarise(total = length(signif), signif = )
+  ggplot(aes(x = se, alpha = signif, fill = Treatment)) +
+  geom_bar(position = "dodge", colour = "gray30") + 
+  scale_alpha_discrete(name = "Significant") +
+  scale_fill_manual(values = config$col.trt2) +
+  # facet_wrap(~se, scales = "free_y") +
+  # facet_grid(se~.) +
+  # coord_flip() +
+  theme(aspect.ratio = 1) +
+  xlab("Omic") +
+  ylab("Count") +
+  gg_45() 
+
+ggsave(paste0(dir.out, "/barplot_de_nofacet.svg"))
+ggsave(paste0(dir.out, "/barplot_de_nofacet.pdf"))
+ggsave(paste0(dir.out, "/barplot_de_nofacet.png"))
+```
+
+## Volcano plots
+
+
+```{r, fig.width=8, fig.height=6}
+fill.legend <- c(
+  setNames(config$col.trt2, paste0("Signif. in ", names(config$col.trt2))), 
+  setNames(c("gray40", "gray40"), paste0("N.s. in ", names(config$col.trt2)))
+)
+col.legend <- setNames(
+  c("black", "black", "white", "white"), 
+  names(fill.legend)
+)
+alpha.legend <- setNames(
+  c(1, 1, .1, .1), 
+  names(fill.legend)
+)
+
+mutate(df.fc.age, 
+       Age = ifelse(signif, "Signif.", "N.s."), 
+       Legend = paste0(Age, " in ", Treatment)) %>%
+  ggplot(aes(x = scoef.AGE, y = -log10(spval.adj.AGE), 
+             fill = Legend, colour = Legend, alpha = Legend)) +
+  geom_hline(yintercept = 0, colour = "gray60") +
+  geom_vline(xintercept = 0, colour = "gray60") +
+  geom_point(cex = .85, pch = 21, stroke = .25) + 
+  scale_fill_manual(values = fill.legend) +
+  scale_colour_manual(values = col.legend) +
+  scale_alpha_manual(values = alpha.legend) +
+  facet_grid(Treatment~se) +
+  theme(aspect.ratio = 1, strip.text.y = element_text(angle = 0)) +
+  xlab("Log2 fold change (age)") +
+  ylab("-log10(FDR)") 
+
+ggsave(filename = paste0(dir.out, "/volcano_general_facet.png"))
+ggsave(filename = paste0(dir.out, "/volcano_general_facet.pdf"))
+ggsave(filename = paste0(dir.out, "/volcano_general_facet.svg"))
+```
+
+
+
+
+# Reproducibility
+
+```{r}
+date()
+```
+
+```{r}
+sessionInfo()
+```
+
+
+
